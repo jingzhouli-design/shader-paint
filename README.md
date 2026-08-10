@@ -1,17 +1,15 @@
-# Shader Paint Web App
+# ShaderPaintIpad
 
-This is a standalone browser version of Shader Paint. Its interface and
-browser rendering code match the current project; Electron packaging is not
-included in this folder.
+This is a standalone browser version of Shader Paint prepared for iPad UI
+work. It can be moved out of the parent project without requiring Electron,
+the parent `Texture` directory, or any other parent-project files.
 
 ## Included brush library
 
-The Web App includes all 42 PNG brushes used by the current brush panel:
-Essential (4), Surface & Wear (16), Scratch Marks (6), Textured Scratches
-(6), and Fabrication (10). The brush images are served from
-`public/brushes/` and are loaded by the existing brush UI.
-
-The unrelated desktop material/3D texture folders are intentionally excluded.
+The Web App includes every currently supported image in the source `Texture`
+brush library: 239 brushes across 11 groups. The images and their portable
+`brush-library.json` manifest are served from `public/brushes/` and loaded by
+the existing brush UI.
 
 ## Test locally
 

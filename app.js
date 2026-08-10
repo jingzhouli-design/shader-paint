@@ -113,6 +113,7 @@ const recentProjectsEmpty = document.getElementById("recentProjectsEmpty");
 const settingsPanel = document.getElementById("settingsPanel");
 const projectAutosaveEnabled = document.getElementById("projectAutosaveEnabled");
 const projectAutosaveInterval = document.getElementById("projectAutosaveInterval");
+const ignoreTouchDraw = document.getElementById("ignoreTouchDraw");
 const pressureSizeMinimum = document.getElementById("pressureSizeMinimum");
 const pressureSizeMinimumNumber = document.getElementById("pressureSizeMinimumNumber");
 const pressureSizeCurveToggle = document.getElementById("pressureSizeCurveToggle");
@@ -198,40 +199,6 @@ let BRUSH_GROUPS = [
   { id: "stylized", label: "Fabrication" },
 ];
 const LEGACY_BRUSH_PRESETS = Object.freeze([...BRUSH_PRESETS]);
-const BUNDLED_BRUSH_GROUPS = [
-  {
-    id: "Essential",
-    files: ["Chipped Edge.png", "Hard Surface.png", "Soft Airbrush.png", "Worn Edge.png"],
-  },
-  {
-    id: "Surface & Wear",
-    directory: "surface-and-wear",
-    files: [
-      "Coating Flakes.png", "Concrete Pores.png", "Corrosion Pits.png", "Directional Abrasion.png",
-      "Dragged Dirt.png", "Dust Buildup.png", "Fine Surface Dust.png", "Heat Scorch.png",
-      "Heavy Industrial Grunge.png", "Leather Grain.png", "Loose Fibers.png", "Mineral Deposit.png",
-      "Oil Smear.png", "Peeling Coating.png", "Scratch Cluster.png", "Woven Fabric.png",
-    ],
-  },
-  {
-    id: "Scratch Marks",
-    directory: "scratch-marks",
-    files: ["Branch Crack.png", "Claw Drag.png", "Cross Scuff.png", "Impact Burst.png", "Long Gouges.png", "Swept Scrape.png"],
-  },
-  {
-    id: "Textured Scratches",
-    directory: "textured-scratches",
-    files: ["Dry Drag.png", "Heavy Score.png", "Oxidized Scuff.png", "Paint Scrape.png", "Rust Gouge.png", "Splinter Tear.png"],
-  },
-  {
-    id: "Fabrication",
-    files: [
-      "Brushed Metal.png", "Expanded Metal.png", "Fine Machining Lines.png", "Knurled Metal.png",
-      "Micro Perforation.png", "Perforated Sheet.png", "Rivet Heads.png", "Staggered Rivets.png",
-      "Tread Plate.png", "Wire Mesh.png",
-    ],
-  },
-];
 
 window.addEventListener("error", (event) => {
   console.error("[Shader Paint error]", event.error?.stack || event.message);
@@ -328,7 +295,7 @@ const state = {
   layers: [],
   selectedLayerId: null,
   selectionPart: "mask",
-  effectsPaused: false,
+  effectsPaused: true,
   motionTime: 0,
   lastMotionTimestamp: performance.now(),
   lastAnimatedRender: 0,
@@ -349,10 +316,11 @@ const state = {
   maskSettingsLayerId: null,
   maskClipboard: null,
   filterClipboard: null,
-  documentName: "Botanical Study",
+  documentName: "Shader Paint",
   projectFilePath: null,
   projectSaveStatus: "unsaved",
   projectAutosave: { enabled: false, intervalSeconds: 60 },
+  ipad: { ignoreTouchDraw: false, layersCollapsed: false, filtersCollapsed: false, brushPanelPosition: null },
   pressure: {
     sizeMinimum: 0.32,
     sizeResponse: 1,
@@ -373,6 +341,11 @@ const state = {
   sizeAdjustPointerId: null,
   sizeAdjustStart: null,
   eraserPressed: false,
+  eraserToggled: false,
+  touchPointers: new Map(),
+  touchGesture: null,
+  pencilHover: null,
+  touchBrushAdjust: null,
   transformStroke: null,
   paintTransformStroke: null,
   paintingLayerContent: false,
@@ -4424,8 +4397,91 @@ function endPan(event) {
   scheduleViewportSave();
 }
 
+function touchGestureMetrics() {
+  const points = [...state.touchPointers.values()];
+  if (points.length < 2) return null;
+  const [first, second] = points;
+  return {
+    centerX: (first.x + second.x) / 2,
+    centerY: (first.y + second.y) / 2,
+    distance: Math.hypot(second.x - first.x, second.y - first.y),
+  };
+}
+
+function beginTouchGesture(event) {
+  const metrics = touchGestureMetrics();
+  if (!metrics) return;
+  state.touchBrushAdjust = null;
+  if (state.paintPointerId !== null) {
+    endStroke({
+      pointerId: state.paintPointerId,
+      clientX: event.clientX,
+      clientY: event.clientY,
+    });
+  }
+  state.touchGesture = {
+    fingers: state.touchPointers.size,
+    metrics,
+    zoom: state.zoom,
+    viewport: { ...state.viewport },
+    moved: false,
+  };
+  brushCursor.style.opacity = "0";
+}
+
+function updateTouchGesture() {
+  const gesture = state.touchGesture;
+  const metrics = touchGestureMetrics();
+  if (!gesture || !metrics) return;
+  const distanceRatio = metrics.distance / Math.max(1, gesture.metrics.distance);
+  const deltaX = metrics.centerX - gesture.metrics.centerX;
+  const deltaY = metrics.centerY - gesture.metrics.centerY;
+  gesture.moved ||= Math.hypot(deltaX, deltaY) > 8 || Math.abs(distanceRatio - 1) > 0.06;
+  setZoom(gesture.zoom * distanceRatio);
+  state.viewport.x = gesture.viewport.x + deltaX;
+  state.viewport.y = gesture.viewport.y + deltaY;
+  syncViewport();
+}
+
+function finishTouchGesture() {
+  const gesture = state.touchGesture;
+  if (!gesture || state.touchPointers.size) return;
+  state.touchGesture = null;
+  if (!gesture.moved) {
+    if (gesture.fingers === 2) void undoDocument();
+    else if (gesture.fingers >= 3) void redoDocument();
+  }
+  scheduleViewportSave();
+}
+
 function handleCanvasPointerDown(event) {
   canvas.focus({ preventScroll: true });
+  if (event.pointerType === "touch") {
+    state.touchPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    if (state.touchPointers.size >= 2) {
+      event.preventDefault();
+      beginTouchGesture(event);
+      return;
+    }
+    if (state.pencilHover && performance.now() - state.pencilHover.timestamp < 900) {
+      event.preventDefault();
+      state.touchBrushAdjust = {
+        pointerId: event.pointerId,
+        x: event.clientX,
+        y: event.clientY,
+        size: state.brush.size,
+        value: state.brush.value,
+        adjustsValue: state.selectionPart === "mask",
+      };
+      return;
+    }
+    if (state.ipad.ignoreTouchDraw) return;
+  }
+  if (event.pointerType === "pen" && (event.button === 2 || event.button === 5 || (event.buttons & 2))) {
+    event.preventDefault();
+    sampleCanvasColor(event);
+    return;
+  }
   if (event.altKey) {
     event.preventDefault();
     sampleCanvasColor(event);
@@ -4442,6 +4498,26 @@ function handleCanvasPointerDown(event) {
 }
 
 function handleCanvasPointerMove(event) {
+  if (event.pointerType === "pen" && event.buttons === 0) {
+    state.pencilHover = { timestamp: performance.now(), x: event.clientX, y: event.clientY };
+  }
+  if (event.pointerType === "touch" && state.touchPointers.has(event.pointerId)) {
+    state.touchPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    if (state.touchGesture) {
+      event.preventDefault();
+      updateTouchGesture();
+      return;
+    }
+    if (state.touchBrushAdjust?.pointerId === event.pointerId) {
+      event.preventDefault();
+      const adjust = state.touchBrushAdjust;
+      state.brush.size = Math.max(1, Math.round(adjust.size - (event.clientY - adjust.y) * 0.9));
+      if (adjust.adjustsValue) state.brush.value = Math.max(0, Math.min(1, adjust.value + (event.clientX - adjust.x) / 240));
+      syncBrushUi();
+      return;
+    }
+    if (state.ipad.ignoreTouchDraw) return;
+  }
   if (state.sizeAdjustPointerId === event.pointerId) {
     continueBrushSizeAdjust(event);
     return;
@@ -4454,6 +4530,21 @@ function handleCanvasPointerMove(event) {
 }
 
 function handleCanvasPointerEnd(event) {
+  if (event.pointerType === "touch" && state.touchPointers.has(event.pointerId)) {
+    state.touchPointers.delete(event.pointerId);
+    if (state.touchGesture) {
+      event.preventDefault();
+      finishTouchGesture();
+      return;
+    }
+    if (state.touchBrushAdjust?.pointerId === event.pointerId) {
+      event.preventDefault();
+      state.touchBrushAdjust = null;
+      scheduleSave();
+      return;
+    }
+    if (state.ipad.ignoreTouchDraw) return;
+  }
   if (state.sizeAdjustPointerId === event.pointerId) {
     endBrushSizeAdjust(event);
     return;
@@ -5696,6 +5787,9 @@ function syncBrushUi() {
   brushModeButtons.querySelectorAll("[data-brush-mode]").forEach((button) => {
     button.classList.toggle("active", button.dataset.brushMode === state.brush.mode);
   });
+  const eraserToggle = document.getElementById("eraserToggle");
+  eraserToggle.classList.toggle("active", state.eraserPressed);
+  eraserToggle.setAttribute("aria-pressed", String(state.eraserPressed));
   const previewSize = Math.max(8, Math.min(52, state.brush.size * 0.45));
   brushPreviewDot.style.width = `${previewSize}px`;
   brushPreviewDot.style.height = `${previewSize}px`;
@@ -5853,10 +5947,14 @@ function consumeCanvasShortcut(event) {
 }
 
 function setTemporaryEraser(active) {
-  if (state.eraserPressed === active) return;
-  state.eraserPressed = active;
-  canvas.classList.toggle("is-erasing", active);
-  brushCursor.classList.toggle("is-erasing", active);
+  const next = active || state.eraserToggled;
+  if (state.eraserPressed === next) return;
+  state.eraserPressed = next;
+  canvas.classList.toggle("is-erasing", next);
+  brushCursor.classList.toggle("is-erasing", next);
+  const eraserToggle = document.getElementById("eraserToggle");
+  eraserToggle.classList.toggle("active", next);
+  eraserToggle.setAttribute("aria-pressed", String(next));
   updateBrushCursor({ clientX: state.lastPointer.x, clientY: state.lastPointer.y, altKey: false });
 }
 
@@ -6002,14 +6100,19 @@ function legacyBrushTextureFiles() {
   });
 }
 
-function bundledBrushTextureLibrary() {
+async function bundledBrushTextureLibrary() {
+  const manifestUrl = new URL("./brushes/brush-library.json", window.location.href);
+  const response = await fetch(manifestUrl);
+  if (!response.ok) throw new Error(`Could not load the bundled brush library (${response.status}).`);
+  const manifest = await response.json();
+  if (!Array.isArray(manifest.groups)) throw new Error("The bundled brush library is invalid.");
   return {
-    groups: BUNDLED_BRUSH_GROUPS.map((group) => ({
+    groups: manifest.groups.map((group) => ({
       id: group.id,
-      name: group.id,
+      name: group.name,
       brushes: group.files.map((name) => {
         const imageUrl = new URL(
-          `./brushes/${encodeURIComponent(group.directory || group.id)}/${encodeURIComponent(name)}`,
+          `./brushes/${encodeURIComponent(group.directory)}/${encodeURIComponent(name)}`,
           window.location.href,
         ).href;
         return {
@@ -6027,7 +6130,12 @@ function bundledBrushTextureLibrary() {
 async function initializeBrushTextureLibrary() {
   const desktop = window.shaderPaintDesktop;
   if (!desktop?.isDesktop) {
-    applyBrushTextureLibrary(bundledBrushTextureLibrary());
+    try {
+      applyBrushTextureLibrary(await bundledBrushTextureLibrary());
+    } catch (error) {
+      console.error("Shader Paint could not load the bundled brush library.", error);
+      showToast("Bundled brush library could not be loaded. Using built-in brushes.");
+    }
     return;
   }
   try {
@@ -6186,6 +6294,14 @@ function loadProjectSettings() {
     const stored = JSON.parse(localStorage.getItem(PROJECT_SETTINGS_KEY) || "{}");
     state.projectAutosave.enabled = stored.projectAutosave?.enabled === true;
     state.projectAutosave.intervalSeconds = Math.max(15, Math.min(3600, Number(stored.projectAutosave?.intervalSeconds) || 60));
+    state.ipad.ignoreTouchDraw = stored.ipad?.ignoreTouchDraw === true;
+    state.ipad.layersCollapsed = stored.ipad?.layersCollapsed === true;
+    state.ipad.filtersCollapsed = stored.ipad?.filtersCollapsed === true;
+    state.ipad.brushPanelPosition = stored.ipad?.brushPanelPosition
+      && Number.isFinite(stored.ipad.brushPanelPosition.x)
+      && Number.isFinite(stored.ipad.brushPanelPosition.y)
+      ? stored.ipad.brushPanelPosition
+      : null;
     state.pressure.sizeMinimum = clampPressureSetting(stored.pressure?.sizeMinimum, 0, 1, 0.32);
     state.pressure.sizeResponse = clampPressureSetting(stored.pressure?.sizeResponse, 0.25, 3, 1);
     state.pressure.opacityMinimum = clampPressureSetting(stored.pressure?.opacityMinimum, 0, 1, 0.2);
@@ -6206,6 +6322,7 @@ function saveProjectSettings() {
     version: 1,
     projectAutosave: state.projectAutosave,
     pressure: state.pressure,
+    ipad: state.ipad,
     filterMenuCategoryOrder: state.filterMenuCategoryOrder,
     filterMenuFilterOrders: state.filterMenuFilterOrders,
   }));
@@ -6248,6 +6365,7 @@ function syncSettingsPanel() {
   projectAutosaveInterval.value = String(state.projectAutosave.intervalSeconds);
   projectAutosaveEnabled.disabled = !window.shaderPaintDesktop?.isDesktop;
   projectAutosaveInterval.disabled = !window.shaderPaintDesktop?.isDesktop || !state.projectAutosave.enabled;
+  ignoreTouchDraw.checked = state.ipad.ignoreTouchDraw;
   syncPressureSettings();
 }
 
@@ -6268,6 +6386,32 @@ function bindPressureSettingControl(range, number, key, scale, minimum, maximum)
 function setSettingsOpen(open) {
   settingsPanel.hidden = !open;
   if (open) syncSettingsPanel();
+}
+
+function syncDockPanels() {
+  const rightDock = document.getElementById("rightDock");
+  const layersCollapsed = state.ipad.layersCollapsed;
+  const filtersCollapsed = state.ipad.filtersCollapsed;
+  document.getElementById("layersPanel").classList.toggle("is-collapsed", layersCollapsed);
+  document.getElementById("filtersPanel").classList.toggle("is-collapsed", filtersCollapsed);
+  rightDock.classList.toggle("layers-collapsed", layersCollapsed);
+  rightDock.classList.toggle("filters-collapsed", filtersCollapsed);
+  document.getElementById("collapseLayers").setAttribute("aria-expanded", String(!layersCollapsed));
+  document.getElementById("collapseFilters").setAttribute("aria-expanded", String(!filtersCollapsed));
+  document.getElementById("collapseLayers").textContent = layersCollapsed ? "‹" : "›";
+  document.getElementById("collapseFilters").textContent = filtersCollapsed ? "‹" : "›";
+  document.getElementById("collapseLayers").dataset.collapsed = String(layersCollapsed);
+  document.getElementById("collapseFilters").dataset.collapsed = String(filtersCollapsed);
+  syncCanvasPresentation();
+}
+
+function syncBrushPanelPosition() {
+  const position = state.ipad.brushPanelPosition;
+  if (!position) return;
+  const brushPanel = document.getElementById("brushPanel");
+  brushPanel.style.left = `${position.x}px`;
+  brushPanel.style.top = `${position.y}px`;
+  brushPanel.style.transform = "none";
 }
 
 function scheduleProjectFileAutosave() {
@@ -7227,7 +7371,7 @@ async function applyStoredDocument(stored) {
     ? stored.selectedLayerId
     : restoredLayers[restoredLayers.length - 1].id;
   state.selectionPart = stored.selectionPart === "mask" ? "mask" : "content";
-  state.effectsPaused = stored.effectsPaused === true;
+  state.effectsPaused = stored.effectsPaused !== false;
   state.brush = { ...state.brush, ...stored.brush };
   state.documentName = normalizeProjectName(stored.documentName || state.documentName);
   state.viewport = { ...state.viewport, ...stored.viewport };
@@ -7308,7 +7452,7 @@ async function loadStarter() {
   state.layers = [base, texture];
   state.selectedLayerId = texture.id;
   state.selectionPart = "mask";
-  state.documentName = "Botanical Study";
+  state.documentName = "Shader Paint";
   state.projectFilePath = null;
   state.projectSaveStatus = "unsaved";
   syncDocumentMeta();
@@ -7534,6 +7678,7 @@ function wireEvents() {
       void flushDocumentAutosave().finally(() => desktop.autosaveFlushComplete?.());
     });
   }
+  document.getElementById("webSettingsButton").addEventListener("click", () => setSettingsOpen(settingsPanel.hidden));
 
   canvas.addEventListener("pointerdown", handleCanvasPointerDown);
   canvas.addEventListener("pointermove", handleCanvasPointerMove);
@@ -7630,10 +7775,72 @@ function wireEvents() {
     requestRender();
     scheduleSave();
   });
+  document.getElementById("eraserToggle").addEventListener("click", () => {
+    if (state.paintPointerId !== null) return;
+    state.eraserToggled = !state.eraserToggled;
+    setTemporaryEraser(heldCanvasShortcutCodes.has("KeyE"));
+    syncBrushUi();
+  });
+  document.getElementById("collapseLayers").addEventListener("click", () => {
+    state.ipad.layersCollapsed = !state.ipad.layersCollapsed;
+    saveProjectSettings();
+    syncDockPanels();
+  });
+  document.getElementById("collapseFilters").addEventListener("click", () => {
+    state.ipad.filtersCollapsed = !state.ipad.filtersCollapsed;
+    saveProjectSettings();
+    syncDockPanels();
+  });
 
   brushPreview.addEventListener("click", () => {
     setBrushLibraryOpen(brushLibrary.hidden);
   });
+  const brushPanel = document.getElementById("brushPanel");
+  const brushPanelHandle = brushPanel.querySelector(".panel-heading");
+  let brushPanelDrag = null;
+  brushPanelHandle.addEventListener("pointerdown", (event) => {
+    if (event.target.closest("button")) return;
+    const stageRect = canvasStage.getBoundingClientRect();
+    const panelRect = brushPanel.getBoundingClientRect();
+    brushPanelDrag = {
+      pointerId: event.pointerId,
+      offsetX: event.clientX - panelRect.left,
+      offsetY: event.clientY - panelRect.top,
+      stageRect,
+      baseX: panelRect.left - stageRect.left,
+      baseY: panelRect.top - stageRect.top,
+      x: panelRect.left - stageRect.left,
+      y: panelRect.top - stageRect.top,
+    };
+    brushPanel.style.left = `${brushPanelDrag.baseX}px`;
+    brushPanel.style.top = `${brushPanelDrag.baseY}px`;
+    brushPanel.classList.add("is-dragging");
+    brushPanelHandle.setPointerCapture(event.pointerId);
+    event.preventDefault();
+  });
+  brushPanelHandle.addEventListener("pointermove", (event) => {
+    if (!brushPanelDrag || brushPanelDrag.pointerId !== event.pointerId) return;
+    const { stageRect, offsetX, offsetY } = brushPanelDrag;
+    const panelWidth = brushPanel.offsetWidth;
+    const panelHeight = brushPanel.offsetHeight;
+    const x = Math.max(8, Math.min(stageRect.width - panelWidth - 8, event.clientX - stageRect.left - offsetX));
+    const y = Math.max(8, Math.min(stageRect.height - panelHeight - 8, event.clientY - stageRect.top - offsetY));
+    brushPanelDrag.x = x;
+    brushPanelDrag.y = y;
+    brushPanel.style.transform = `translate3d(${x - brushPanelDrag.baseX}px, ${y - brushPanelDrag.baseY}px, 0)`;
+  });
+  ["pointerup", "pointercancel"].forEach((eventName) => brushPanelHandle.addEventListener(eventName, (event) => {
+    if (!brushPanelDrag || brushPanelDrag.pointerId !== event.pointerId) return;
+    if (brushPanelHandle.hasPointerCapture(event.pointerId)) brushPanelHandle.releasePointerCapture(event.pointerId);
+    const changed = eventName === "pointerup";
+    if (changed) {
+      state.ipad.brushPanelPosition = { x: brushPanelDrag.x, y: brushPanelDrag.y };
+      syncBrushPanelPosition();
+    }
+    brushPanel.classList.remove("is-dragging");
+    brushPanelDrag = null;
+    if (changed) saveProjectSettings();
+  }));
   document.getElementById("closeBrushLibrary").addEventListener("click", () => setBrushLibraryOpen(false));
   document.getElementById("openBrushTextureFolder").addEventListener("click", () => {
     desktop?.openBrushTextureFolder?.().catch(reportError);
@@ -7657,6 +7864,10 @@ function wireEvents() {
     saveProjectSettings();
     syncSettingsPanel();
     scheduleProjectFileAutosave();
+  });
+  ignoreTouchDraw.addEventListener("change", () => {
+    state.ipad.ignoreTouchDraw = ignoreTouchDraw.checked;
+    saveProjectSettings();
   });
   bindPressureSettingControl(
     pressureSizeMinimum,
@@ -7836,7 +8047,9 @@ function wireEvents() {
     commitDocumentAction();
   });
 
+  let suppressLayerClickUntil = 0;
   layerList.addEventListener("click", (event) => {
+    if (performance.now() < suppressLayerClickUntil) return;
     const row = event.target.closest(".layer-row");
     if (!row) return;
     const layer = state.layers.find((item) => item.id === row.dataset.layerId);
@@ -7933,6 +8146,58 @@ function wireEvents() {
 
   let draggedLayerId = null;
   let layerDropAfter = false;
+  let layerPress = null;
+  const clearLayerPress = () => {
+    if (layerPress?.timer) window.clearTimeout(layerPress.timer);
+    layerList.querySelectorAll(".touch-dragging, .drop-before, .drop-after").forEach((item) => {
+      item.classList.remove("touch-dragging", "drop-before", "drop-after");
+    });
+    layerPress = null;
+  };
+  layerList.addEventListener("pointerdown", (event) => {
+    if (event.pointerType === "mouse" || event.target.closest("button, input, .layer-name")) return;
+    const row = event.target.closest(".layer-row");
+    if (!row) return;
+    layerPress = { pointerId: event.pointerId, layerId: row.dataset.layerId, active: false };
+    layerPress.timer = window.setTimeout(() => {
+      if (!layerPress || layerPress.pointerId !== event.pointerId) return;
+      layerPress.active = true;
+      row.classList.add("touch-dragging");
+      layerList.setPointerCapture(event.pointerId);
+      if (navigator.vibrate) navigator.vibrate(12);
+    }, 420);
+  });
+  layerList.addEventListener("pointermove", (event) => {
+    if (!layerPress?.active || layerPress.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    const row = document.elementFromPoint(event.clientX, event.clientY)?.closest(".layer-row");
+    if (!row) return;
+    layerDropAfter = event.clientY > row.getBoundingClientRect().top + row.getBoundingClientRect().height / 2;
+    layerList.querySelectorAll(".drop-before, .drop-after").forEach((item) => item.classList.remove("drop-before", "drop-after"));
+    row.classList.add(layerDropAfter ? "drop-after" : "drop-before");
+  });
+  layerList.addEventListener("pointerup", (event) => {
+    if (!layerPress || layerPress.pointerId !== event.pointerId) return;
+    const press = layerPress;
+    if (!press.active) {
+      clearLayerPress();
+      return;
+    }
+    event.preventDefault();
+    suppressLayerClickUntil = performance.now() + 350;
+    const row = document.elementFromPoint(event.clientX, event.clientY)?.closest(".layer-row");
+    const display = [...state.layers].reverse();
+    const reordered = row && reorderByIds(display, press.layerId, row.dataset.layerId, layerDropAfter);
+    if (reordered) {
+      state.layers = display.reverse();
+      normalizeAdjustmentStarts();
+      renderLayers();
+      requestRender();
+      commitDocumentAction();
+    }
+    clearLayerPress();
+  });
+  layerList.addEventListener("pointercancel", clearLayerPress);
   layerList.addEventListener("dragstart", (event) => {
     const row = event.target.closest(".layer-row");
     draggedLayerId = row?.dataset.layerId || null;
@@ -8530,6 +8795,57 @@ function wireEvents() {
 
   let draggedFilterId = null;
   let filterDropAfter = false;
+  let filterPress = null;
+  const clearFilterPress = () => {
+    if (filterPress?.timer) window.clearTimeout(filterPress.timer);
+    filterList.querySelectorAll(".touch-dragging, .filter-drop-before, .filter-drop-after").forEach((item) => {
+      item.classList.remove("touch-dragging", "filter-drop-before", "filter-drop-after");
+    });
+    filterPress = null;
+  };
+  filterList.addEventListener("pointerdown", (event) => {
+    if (event.pointerType === "mouse" || event.target.closest("button, input, select, label")) return;
+    const card = event.target.closest(".filter-card");
+    if (!card) return;
+    filterPress = { pointerId: event.pointerId, filterId: card.dataset.filterId, active: false };
+    filterPress.timer = window.setTimeout(() => {
+      if (!filterPress || filterPress.pointerId !== event.pointerId) return;
+      filterPress.active = true;
+      card.classList.add("touch-dragging");
+      filterList.setPointerCapture(event.pointerId);
+      if (navigator.vibrate) navigator.vibrate(12);
+    }, 420);
+  });
+  filterList.addEventListener("pointermove", (event) => {
+    if (!filterPress?.active || filterPress.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    const card = document.elementFromPoint(event.clientX, event.clientY)?.closest(".filter-card");
+    if (!card) return;
+    filterDropAfter = event.clientY > card.getBoundingClientRect().top + card.getBoundingClientRect().height / 2;
+    filterList.querySelectorAll(".filter-drop-before, .filter-drop-after").forEach((item) => item.classList.remove("filter-drop-before", "filter-drop-after"));
+    card.classList.add(filterDropAfter ? "filter-drop-after" : "filter-drop-before");
+  });
+  filterList.addEventListener("pointerup", (event) => {
+    if (!filterPress || filterPress.pointerId !== event.pointerId) return;
+    const press = filterPress;
+    if (!press.active) {
+      clearFilterPress();
+      return;
+    }
+    event.preventDefault();
+    const card = document.elementFromPoint(event.clientX, event.clientY)?.closest(".filter-card");
+    const layer = getSelectedLayer();
+    const reordered = card && layer && reorderByIds(layer.filters, press.filterId, card.dataset.filterId, filterDropAfter);
+    if (reordered) {
+      invalidateLayerThumbnail(layer);
+      renderLayers();
+      renderFilters();
+      requestRender();
+      commitDocumentAction();
+    }
+    clearFilterPress();
+  });
+  filterList.addEventListener("pointercancel", clearFilterPress);
   filterList.addEventListener("dragstart", (event) => {
     const handle = event.target.closest("[data-filter-drag]");
     if (!handle) {
@@ -8676,6 +8992,8 @@ function wireEvents() {
       if (state.selectionPart !== "mask" || !layer?.mask) return;
       state.brush.value = 1 - state.brush.value;
       syncBrushUi();
+      syncDockPanels();
+      syncBrushPanelPosition();
       updateBrushCursor({ clientX: state.lastPointer.x, clientY: state.lastPointer.y, altKey: false });
       commitDocumentAction();
       return;
