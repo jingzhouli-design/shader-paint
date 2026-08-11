@@ -923,6 +923,7 @@ precision highp float;
 in vec2 vUv;
 out vec4 outColor;
 uniform sampler2D uMaskSource;
+uniform sampler2D uMaskBase;
 uniform vec2 uResolution;
 uniform vec4 uDabs[64];
 uniform int uDabCount;
@@ -947,6 +948,14 @@ float resolvedBrushStrength(vec2 local, float distanceToCenter) {
 }
 void main() {
   float value = texture(uMaskSource, vUv).r;
+  // uMaskBase is a snapshot of the mask from before this stroke began (see
+  // state.strokeHistory.baseTexture). Blending each dab against that fixed base and
+  // taking the strongest single-dab pull (max/min) rather than mixing into the
+  // already-painted "value" keeps a whole stroke's opacity capped at what one dab's
+  // pressure would achieve, instead of dozens of overlapping dabs compounding toward
+  // full target regardless of how low the per-dab opacity is.
+  float baseValue = texture(uMaskBase, vUv).r;
+  bool rising = uTarget >= baseValue;
   for (int index = 0; index < 64; index += 1) {
     if (index >= uDabCount) break;
     vec4 dab = uDabs[index];
@@ -960,7 +969,8 @@ void main() {
       0.0,
       1.0
     ) * brushEdgeFade(distanceToCenter);
-    value = mix(value, uTarget, min(1.0, dab.w * brushAlpha));
+    float candidate = mix(baseValue, uTarget, min(1.0, dab.w * brushAlpha));
+    value = rising ? max(value, candidate) : min(value, candidate);
   }
   outColor = vec4(value, 0.0, 0.0, 1.0);
 }`;
@@ -3109,6 +3119,7 @@ function stampMaskGpu(mask, dabs, target, dirty) {
   gl.useProgram(gpu.maskBrushProgram);
   bindTexture(gpu.maskBrushProgram, "uMaskSource", mask.texture, 0);
   bindBrushTexture(gpu.maskBrushProgram, preset, 1);
+  bindTexture(gpu.maskBrushProgram, "uMaskBase", state.strokeHistory?.baseTexture || mask.texture, 2);
   gl.uniform2f(gl.getUniformLocation(gpu.maskBrushProgram, "uResolution"), DOC_WIDTH, DOC_HEIGHT);
   gl.uniform4fv(
     gl.getUniformLocation(gpu.maskBrushProgram, "uDabs[0]"),
@@ -4199,7 +4210,9 @@ function continueStroke(event) {
   if (state.paintPointerId !== event.pointerId) return;
   event.preventDefault();
   if (state.transformStroke) {
-    state.transformStroke.endpoint = pointerToDocument(event);
+    const sample = pointerToDocument(event);
+    state.transformStroke.endpoint = sample;
+    state.transformStroke.center.pressure = sample.pressure;
     updateTransformMaskPreview(state.transformStroke);
     return;
   }
@@ -4207,7 +4220,9 @@ function continueStroke(event) {
     const layer = getSelectedLayer();
     if (state.paintTransformStroke) {
       const transform = state.paintTransformStroke;
-      transform.endpoint = pointerToDocument(event);
+      const sample = pointerToDocument(event);
+      transform.endpoint = sample;
+      transform.center.pressure = sample.pressure;
       transform.previewPending = true;
       requestRender();
       return;
@@ -4423,7 +4438,6 @@ function beginTouchGesture(event) {
     fingers: state.touchPointers.size,
     metrics,
     zoom: state.zoom,
-    viewport: { ...state.viewport },
     moved: false,
   };
   brushCursor.style.opacity = "0";
@@ -4438,9 +4452,6 @@ function updateTouchGesture() {
   const deltaY = metrics.centerY - gesture.metrics.centerY;
   gesture.moved ||= Math.hypot(deltaX, deltaY) > 8 || Math.abs(distanceRatio - 1) > 0.06;
   setZoom(gesture.zoom * distanceRatio);
-  state.viewport.x = gesture.viewport.x + deltaX;
-  state.viewport.y = gesture.viewport.y + deltaY;
-  syncViewport();
 }
 
 function finishTouchGesture() {
@@ -4454,6 +4465,16 @@ function finishTouchGesture() {
   scheduleViewportSave();
 }
 
+function captureAllTouchPointers(target) {
+  state.touchPointers.forEach((_point, pointerId) => {
+    try {
+      target.setPointerCapture(pointerId);
+    } catch {
+      /* pointer may already have ended */
+    }
+  });
+}
+
 function handleCanvasPointerDown(event) {
   canvas.focus({ preventScroll: true });
   if (event.pointerType === "touch") {
@@ -4461,6 +4482,7 @@ function handleCanvasPointerDown(event) {
     if (state.touchPointers.size >= 2) {
       event.preventDefault();
       beginTouchGesture(event);
+      captureAllTouchPointers(canvasStage);
       return;
     }
     if (state.pencilHover && performance.now() - state.pencilHover.timestamp < 900) {
@@ -4472,7 +4494,10 @@ function handleCanvasPointerDown(event) {
         size: state.brush.size,
         value: state.brush.value,
         adjustsValue: state.selectionPart === "mask",
+        cursorX: state.pencilHover.x,
+        cursorY: state.pencilHover.y,
       };
+      canvasStage.setPointerCapture(event.pointerId);
       return;
     }
     if (state.ipad.ignoreTouchDraw) return;
@@ -4576,9 +4601,10 @@ function updateBrushCursor(event) {
     brushCursor.style.opacity = "0";
     return;
   }
+  const touchAdjusting = Boolean(state.touchBrushAdjust);
   const rect = canvas.getBoundingClientRect();
   const inside = event.clientX >= rect.left && event.clientX <= rect.right && event.clientY >= rect.top && event.clientY <= rect.bottom;
-  if (!inside || !canvas.classList.contains("is-mask-painting")) {
+  if ((!inside && !touchAdjusting) || !canvas.classList.contains("is-mask-painting")) {
     brushCursor.style.opacity = "0";
     return;
   }
@@ -4586,8 +4612,12 @@ function updateBrushCursor(event) {
   const displaySize = state.brush.size / DOC_WIDTH * rect.width / zoomScale;
   brushCursor.style.width = `${displaySize}px`;
   brushCursor.style.height = `${displaySize}px`;
-  const cursorClientX = state.sizeAdjustPressed && state.sizeAdjustStart ? state.sizeAdjustStart.cursorX : event.clientX;
-  const cursorClientY = state.sizeAdjustPressed && state.sizeAdjustStart ? state.sizeAdjustStart.cursorY : event.clientY;
+  const cursorClientX = touchAdjusting ? state.touchBrushAdjust.cursorX
+    : state.sizeAdjustPressed && state.sizeAdjustStart ? state.sizeAdjustStart.cursorX
+    : event.clientX;
+  const cursorClientY = touchAdjusting ? state.touchBrushAdjust.cursorY
+    : state.sizeAdjustPressed && state.sizeAdjustStart ? state.sizeAdjustStart.cursorY
+    : event.clientY;
   brushCursor.style.left = `${(cursorClientX - rect.left) / zoomScale}px`;
   brushCursor.style.top = `${(cursorClientY - rect.top) / zoomScale}px`;
   brushCursor.classList.toggle("is-erasing", state.eraserPressed);
@@ -5736,6 +5766,55 @@ function reorderByIds(items, draggedId, targetId, insertAfter = null) {
   const destination = adjustedTargetIndex + (insertAfter === null ? (movingDown ? 1 : 0) : Number(insertAfter));
   items.splice(Math.max(0, Math.min(items.length, destination)), 0, item);
   return true;
+}
+
+// Native <input type="range"> thumbs are a tiny touch target, and iOS Safari only drags
+// the thumb itself rather than jumping to a tap anywhere on the track. This lets a drag
+// starting anywhere on any slider move its value relatively from that point, using the
+// track's pixel width for sensitivity, then replays it as normal input/change events so
+// existing wiring (setPairedControl, filter param sliders, zoom, layer opacity) needs no
+// changes.
+function enableRelativeRangeDragging() {
+  let drag = null;
+  document.addEventListener("pointerdown", (event) => {
+    const range = event.target;
+    if (!(range instanceof HTMLInputElement) || range.type !== "range" || range.disabled) return;
+    const rect = range.getBoundingClientRect();
+    drag = {
+      pointerId: event.pointerId,
+      range,
+      startX: event.clientX,
+      startValue: Number(range.value),
+      min: Number(range.min) || 0,
+      max: Number.isFinite(Number(range.max)) && range.max !== "" ? Number(range.max) : 100,
+      step: Number(range.step) || 1,
+      width: rect.width || 1,
+    };
+    range.setPointerCapture(event.pointerId);
+    range.focus({ preventScroll: true });
+    event.preventDefault();
+  });
+  document.addEventListener("pointermove", (event) => {
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    const ratio = (event.clientX - drag.startX) / drag.width;
+    let next = drag.startValue + ratio * (drag.max - drag.min);
+    next = Math.max(drag.min, Math.min(drag.max, next));
+    next = Math.round((next - drag.min) / drag.step) * drag.step + drag.min;
+    next = Math.round(next * 1e6) / 1e6;
+    if (String(next) !== drag.range.value) {
+      drag.range.value = String(next);
+      drag.range.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+  });
+  const endDrag = (event) => {
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    if (drag.range.hasPointerCapture(event.pointerId)) drag.range.releasePointerCapture(event.pointerId);
+    drag.range.dispatchEvent(new Event("change", { bubbles: true }));
+    drag = null;
+  };
+  document.addEventListener("pointerup", endDrag);
+  document.addEventListener("pointercancel", endDrag);
 }
 
 function setPairedControl(range, number, value, onChange, onCommit = commitDocumentAction) {
@@ -7669,6 +7748,7 @@ function reportError(error) {
 }
 
 function wireEvents() {
+  enableRelativeRangeDragging();
   const desktop = window.shaderPaintDesktop;
   if (desktop?.isDesktop) {
     document.getElementById("desktopTools").hidden = false;
@@ -7689,6 +7769,70 @@ function wireEvents() {
     if (state.paintPointerId === null) brushCursor.style.opacity = "0";
     else updateBrushCursor(event);
   });
+
+  // Lets the pencil-hover size/value adjust and the two-finger zoom gesture start and
+  // continue anywhere in the left workspace, not only while a finger is over the small
+  // canvas element. Panels (brush panel, brush library, zoom bar, buttons) stay excluded
+  // so a slide across them isn't mistaken for a canvas gesture.
+  const isGestureExcludedTarget = (target) => Boolean(target.closest?.("button, input, select, textarea, .glass-panel"));
+  canvasStage.addEventListener("pointerdown", (event) => {
+    if (event.pointerType !== "touch" || event.target === canvas) return;
+    if (isGestureExcludedTarget(event.target) || state.touchPointers.has(event.pointerId)) return;
+    state.touchPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    if (state.touchPointers.size >= 2) {
+      event.preventDefault();
+      beginTouchGesture(event);
+      captureAllTouchPointers(canvasStage);
+      return;
+    }
+    if (state.pencilHover && performance.now() - state.pencilHover.timestamp < 900) {
+      event.preventDefault();
+      state.touchBrushAdjust = {
+        pointerId: event.pointerId,
+        x: event.clientX,
+        y: event.clientY,
+        size: state.brush.size,
+        value: state.brush.value,
+        adjustsValue: state.selectionPart === "mask",
+        cursorX: state.pencilHover.x,
+        cursorY: state.pencilHover.y,
+      };
+      canvasStage.setPointerCapture(event.pointerId);
+      return;
+    }
+    state.touchPointers.delete(event.pointerId);
+  });
+  canvasStage.addEventListener("pointermove", (event) => {
+    if (state.touchGesture && state.touchPointers.has(event.pointerId)) {
+      state.touchPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+      event.preventDefault();
+      updateTouchGesture();
+      return;
+    }
+    if (state.touchBrushAdjust?.pointerId === event.pointerId) {
+      event.preventDefault();
+      const adjust = state.touchBrushAdjust;
+      state.brush.size = Math.max(1, Math.round(adjust.size - (event.clientY - adjust.y) * 0.9));
+      if (adjust.adjustsValue) state.brush.value = Math.max(0, Math.min(1, adjust.value + (event.clientX - adjust.x) / 240));
+      syncBrushUi();
+    }
+  });
+  const endStageTouchGesture = (event) => {
+    if (!state.touchPointers.has(event.pointerId)) return;
+    const wasGesture = Boolean(state.touchGesture);
+    const wasAdjust = state.touchBrushAdjust?.pointerId === event.pointerId;
+    if (!wasGesture && !wasAdjust) return;
+    event.preventDefault();
+    if (canvasStage.hasPointerCapture(event.pointerId)) canvasStage.releasePointerCapture(event.pointerId);
+    state.touchPointers.delete(event.pointerId);
+    if (wasGesture) finishTouchGesture();
+    if (wasAdjust) {
+      state.touchBrushAdjust = null;
+      scheduleSave();
+    }
+  };
+  canvasStage.addEventListener("pointerup", endStageTouchGesture);
+  canvasStage.addEventListener("pointercancel", endStageTouchGesture);
   window.addEventListener("pointermove", (event) => {
     state.lastPointer = { x: event.clientX, y: event.clientY };
     if (state.panPointerId === event.pointerId) continuePan(event);
