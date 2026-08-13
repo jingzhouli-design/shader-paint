@@ -14,6 +14,7 @@ const PAINT_BRUSH_SPACING_RATIO = 0.05;
 const MAX_LOCAL_AUTOSAVE_CHARACTERS = 2_000_000;
 const AUTOSAVE_IDLE_DELAY_MS = 4000;
 const FILTER_MENU_DRAG_DELAY_MS = 260;
+const TOUCH_REORDER_DELAY_MS = 260;
 const FILTER_MENU_DEFAULT_CATEGORY_ORDER = ["Color", "Distort", "Blur", "Effect", "Generate"];
 const FILTER_CATEGORY_ICONS = {
   "All filters": `<svg viewBox="0 0 16 16"><path d="M3 4h10M3 8h10M3 12h10"/><circle cx="5" cy="4" r=".8"/><circle cx="11" cy="8" r=".8"/><circle cx="7" cy="12" r=".8"/></svg>`,
@@ -4212,7 +4213,7 @@ function continueStroke(event) {
   if (state.transformStroke) {
     const sample = pointerToDocument(event);
     state.transformStroke.endpoint = sample;
-    state.transformStroke.center.pressure = sample.pressure;
+    state.transformStroke.center.pressure = Math.max(state.transformStroke.center.pressure, sample.pressure);
     updateTransformMaskPreview(state.transformStroke);
     return;
   }
@@ -4222,7 +4223,7 @@ function continueStroke(event) {
       const transform = state.paintTransformStroke;
       const sample = pointerToDocument(event);
       transform.endpoint = sample;
-      transform.center.pressure = sample.pressure;
+      transform.center.pressure = Math.max(transform.center.pressure, sample.pressure);
       transform.previewPending = true;
       requestRender();
       return;
@@ -4245,7 +4246,9 @@ function endStroke(event) {
     const mask = layer?.mask;
     const transform = state.transformStroke;
     if (mask) {
-      transform.endpoint = pointerToDocument(event);
+      const sample = pointerToDocument(event);
+      transform.endpoint = sample;
+      transform.center.pressure = Math.max(transform.center.pressure, sample.pressure);
       transform.previewPending = false;
       commitMaskTransformedBrush(mask, transform);
     }
@@ -4261,7 +4264,9 @@ function endStroke(event) {
         paintLayerStamp(layer, pointerToDocument(event));
         flushPendingPaintDabs();
       } else if (state.paintTransformStroke) {
-        state.paintTransformStroke.endpoint = pointerToDocument(event);
+        const sample = pointerToDocument(event);
+        state.paintTransformStroke.endpoint = sample;
+        state.paintTransformStroke.center.pressure = Math.max(state.paintTransformStroke.center.pressure, sample.pressure);
         state.paintTransformStroke.previewPending = false;
         commitPaintLayerTransformedBrush(layer, state.paintTransformStroke);
       }
@@ -4437,7 +4442,6 @@ function beginTouchGesture(event) {
   state.touchGesture = {
     fingers: state.touchPointers.size,
     metrics,
-    zoom: state.zoom,
     moved: false,
   };
   brushCursor.style.opacity = "0";
@@ -4447,11 +4451,21 @@ function updateTouchGesture() {
   const gesture = state.touchGesture;
   const metrics = touchGestureMetrics();
   if (!gesture || !metrics) return;
-  const distanceRatio = metrics.distance / Math.max(1, gesture.metrics.distance);
+  const previous = gesture.metrics;
+  const requestedRatio = metrics.distance / Math.max(1, previous.distance);
+  const nextZoom = Math.max(25, Math.min(200, state.zoom * requestedRatio));
+  const appliedRatio = nextZoom / state.zoom;
+  const stageRect = canvasStage.getBoundingClientRect();
+  const stageCenterX = stageRect.left + stageRect.width / 2;
+  const stageCenterY = stageRect.top + stageRect.height / 2;
   const deltaX = metrics.centerX - gesture.metrics.centerX;
   const deltaY = metrics.centerY - gesture.metrics.centerY;
-  gesture.moved ||= Math.hypot(deltaX, deltaY) > 8 || Math.abs(distanceRatio - 1) > 0.06;
-  setZoom(gesture.zoom * distanceRatio);
+  gesture.moved ||= Math.hypot(deltaX, deltaY) > 3 || Math.abs(requestedRatio - 1) > 0.015;
+  state.viewport.x += deltaX + (1 - appliedRatio) * (previous.centerX - stageCenterX - state.viewport.x);
+  state.viewport.y += deltaY + (1 - appliedRatio) * (previous.centerY - stageCenterY - state.viewport.y);
+  gesture.metrics = metrics;
+  setZoom(nextZoom);
+  syncViewport();
 }
 
 function finishTouchGesture() {
@@ -4475,16 +4489,61 @@ function captureAllTouchPointers(target) {
   });
 }
 
+function handleWorkspaceTouchPointerDown(event) {
+  if (event.pointerType !== "touch" || state.touchPointers.has(event.pointerId)) return;
+  state.touchPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+  if (state.touchPointers.size < 2) return;
+  event.preventDefault();
+  event.stopPropagation();
+  if (state.touchGesture) {
+    state.touchGesture.fingers = Math.max(state.touchGesture.fingers, state.touchPointers.size);
+  } else {
+    beginTouchGesture(event);
+  }
+  captureAllTouchPointers(canvasStage);
+}
+
+function handleWorkspaceTouchPointerMove(event) {
+  if (event.pointerType !== "touch" || !state.touchPointers.has(event.pointerId)) return;
+  state.touchPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+  if (state.touchGesture) {
+    event.preventDefault();
+    event.stopPropagation();
+    updateTouchGesture();
+    return;
+  }
+  // Once canvasStage captures this pointer (see handleCanvasPointerDown), canvas never
+  // sees its move/up events again, so the size/value math has to live here too.
+  if (state.touchBrushAdjust?.pointerId === event.pointerId) {
+    event.preventDefault();
+    event.stopPropagation();
+    const adjust = state.touchBrushAdjust;
+    state.brush.size = Math.max(1, Math.round(adjust.size - (event.clientY - adjust.y) * 0.9));
+    if (adjust.adjustsValue) state.brush.value = Math.max(0, Math.min(1, adjust.value + (event.clientX - adjust.x) / 240));
+    syncBrushUi();
+  }
+}
+
+function handleWorkspaceTouchPointerEnd(event) {
+  if (event.pointerType !== "touch" || !state.touchPointers.has(event.pointerId)) return;
+  const wasGesture = Boolean(state.touchGesture);
+  const wasAdjust = state.touchBrushAdjust?.pointerId === event.pointerId;
+  state.touchPointers.delete(event.pointerId);
+  if (!wasGesture && !wasAdjust) return;
+  event.preventDefault();
+  event.stopPropagation();
+  if (canvasStage.hasPointerCapture(event.pointerId)) canvasStage.releasePointerCapture(event.pointerId);
+  if (wasGesture) finishTouchGesture();
+  if (wasAdjust) {
+    state.touchBrushAdjust = null;
+    scheduleSave();
+  }
+}
+
 function handleCanvasPointerDown(event) {
   canvas.focus({ preventScroll: true });
   if (event.pointerType === "touch") {
-    state.touchPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
-    if (state.touchPointers.size >= 2) {
-      event.preventDefault();
-      beginTouchGesture(event);
-      captureAllTouchPointers(canvasStage);
-      return;
-    }
+    if (state.touchGesture) return;
     if (state.pencilHover && performance.now() - state.pencilHover.timestamp < 900) {
       event.preventDefault();
       state.touchBrushAdjust = {
@@ -4527,12 +4586,7 @@ function handleCanvasPointerMove(event) {
     state.pencilHover = { timestamp: performance.now(), x: event.clientX, y: event.clientY };
   }
   if (event.pointerType === "touch" && state.touchPointers.has(event.pointerId)) {
-    state.touchPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
-    if (state.touchGesture) {
-      event.preventDefault();
-      updateTouchGesture();
-      return;
-    }
+    if (state.touchGesture) return;
     if (state.touchBrushAdjust?.pointerId === event.pointerId) {
       event.preventDefault();
       const adjust = state.touchBrushAdjust;
@@ -4556,12 +4610,8 @@ function handleCanvasPointerMove(event) {
 
 function handleCanvasPointerEnd(event) {
   if (event.pointerType === "touch" && state.touchPointers.has(event.pointerId)) {
+    if (state.touchGesture) return;
     state.touchPointers.delete(event.pointerId);
-    if (state.touchGesture) {
-      event.preventDefault();
-      finishTouchGesture();
-      return;
-    }
     if (state.touchBrushAdjust?.pointerId === event.pointerId) {
       event.preventDefault();
       state.touchBrushAdjust = null;
@@ -4736,6 +4786,17 @@ function renderLayers() {
   syncHistoryButtons();
   syncMaskBadge();
   syncCanvasCursor();
+}
+
+function syncAdjustmentTargetHighlight(adjustmentLayerId = null) {
+  const adjustment = state.layers.find((layer) => layer.id === adjustmentLayerId && layer.kind === "adjustment");
+  const targetId = adjustment && hasCustomAdjustmentStart(adjustment)
+    ? adjustment.adjustmentStartLayerId
+    : null;
+  layerList.querySelectorAll(".layer-row.adjustment-target").forEach((row) => {
+    row.classList.remove("adjustment-target");
+  });
+  if (targetId) layerList.querySelector(`[data-layer-id="${targetId}"]`)?.classList.add("adjustment-target");
 }
 
 function syncFilterPreviewControl() {
@@ -5275,6 +5336,9 @@ function finishFilterMenuDrag(event, cancelled = false) {
     if (!cancelled) {
       activateFilterMenuItem(drag.type, drag.id);
       state.filterMenuIgnoreClick = true;
+      window.setTimeout(() => {
+        state.filterMenuIgnoreClick = false;
+      }, 0);
     }
     return;
   }
@@ -7749,6 +7813,33 @@ function reportError(error) {
 
 function wireEvents() {
   enableRelativeRangeDragging();
+  let pencilReadonlyInput = null;
+  document.addEventListener("pointerdown", (event) => {
+    const input = event.target;
+    if (event.pointerType !== "pen" || !(input instanceof HTMLInputElement) || input.type !== "number") return;
+    pencilReadonlyInput = input;
+    input.dataset.previousInputMode = input.inputMode;
+    input.readOnly = true;
+    input.inputMode = "none";
+    input.dataset.pencilReadonly = "true";
+    input.focus({ preventScroll: true });
+    input.select();
+    event.preventDefault();
+  }, true);
+  const restorePencilNumberInput = () => {
+    const input = pencilReadonlyInput;
+    if (!input) return;
+    input.readOnly = false;
+    input.inputMode = input.dataset.previousInputMode || "";
+    delete input.dataset.pencilReadonly;
+    delete input.dataset.previousInputMode;
+    pencilReadonlyInput = null;
+  };
+  document.addEventListener("pointerup", restorePencilNumberInput, true);
+  document.addEventListener("pointercancel", restorePencilNumberInput, true);
+  ["gesturestart", "gesturechange", "gestureend"].forEach((eventName) => {
+    document.addEventListener(eventName, (event) => event.preventDefault(), { passive: false });
+  });
   const desktop = window.shaderPaintDesktop;
   if (desktop?.isDesktop) {
     document.getElementById("desktopTools").hidden = false;
@@ -7770,69 +7861,10 @@ function wireEvents() {
     else updateBrushCursor(event);
   });
 
-  // Lets the pencil-hover size/value adjust and the two-finger zoom gesture start and
-  // continue anywhere in the left workspace, not only while a finger is over the small
-  // canvas element. Panels (brush panel, brush library, zoom bar, buttons) stay excluded
-  // so a slide across them isn't mistaken for a canvas gesture.
-  const isGestureExcludedTarget = (target) => Boolean(target.closest?.("button, input, select, textarea, .glass-panel"));
-  canvasStage.addEventListener("pointerdown", (event) => {
-    if (event.pointerType !== "touch" || event.target === canvas) return;
-    if (isGestureExcludedTarget(event.target) || state.touchPointers.has(event.pointerId)) return;
-    state.touchPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
-    if (state.touchPointers.size >= 2) {
-      event.preventDefault();
-      beginTouchGesture(event);
-      captureAllTouchPointers(canvasStage);
-      return;
-    }
-    if (state.pencilHover && performance.now() - state.pencilHover.timestamp < 900) {
-      event.preventDefault();
-      state.touchBrushAdjust = {
-        pointerId: event.pointerId,
-        x: event.clientX,
-        y: event.clientY,
-        size: state.brush.size,
-        value: state.brush.value,
-        adjustsValue: state.selectionPart === "mask",
-        cursorX: state.pencilHover.x,
-        cursorY: state.pencilHover.y,
-      };
-      canvasStage.setPointerCapture(event.pointerId);
-      return;
-    }
-    state.touchPointers.delete(event.pointerId);
-  });
-  canvasStage.addEventListener("pointermove", (event) => {
-    if (state.touchGesture && state.touchPointers.has(event.pointerId)) {
-      state.touchPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
-      event.preventDefault();
-      updateTouchGesture();
-      return;
-    }
-    if (state.touchBrushAdjust?.pointerId === event.pointerId) {
-      event.preventDefault();
-      const adjust = state.touchBrushAdjust;
-      state.brush.size = Math.max(1, Math.round(adjust.size - (event.clientY - adjust.y) * 0.9));
-      if (adjust.adjustsValue) state.brush.value = Math.max(0, Math.min(1, adjust.value + (event.clientX - adjust.x) / 240));
-      syncBrushUi();
-    }
-  });
-  const endStageTouchGesture = (event) => {
-    if (!state.touchPointers.has(event.pointerId)) return;
-    const wasGesture = Boolean(state.touchGesture);
-    const wasAdjust = state.touchBrushAdjust?.pointerId === event.pointerId;
-    if (!wasGesture && !wasAdjust) return;
-    event.preventDefault();
-    if (canvasStage.hasPointerCapture(event.pointerId)) canvasStage.releasePointerCapture(event.pointerId);
-    state.touchPointers.delete(event.pointerId);
-    if (wasGesture) finishTouchGesture();
-    if (wasAdjust) {
-      state.touchBrushAdjust = null;
-      scheduleSave();
-    }
-  };
-  canvasStage.addEventListener("pointerup", endStageTouchGesture);
-  canvasStage.addEventListener("pointercancel", endStageTouchGesture);
+  canvasStage.addEventListener("pointerdown", handleWorkspaceTouchPointerDown, true);
+  canvasStage.addEventListener("pointermove", handleWorkspaceTouchPointerMove, true);
+  canvasStage.addEventListener("pointerup", handleWorkspaceTouchPointerEnd, true);
+  canvasStage.addEventListener("pointercancel", handleWorkspaceTouchPointerEnd, true);
   window.addEventListener("pointermove", (event) => {
     state.lastPointer = { x: event.clientX, y: event.clientY };
     if (state.panPointerId === event.pointerId) continuePan(event);
@@ -8251,12 +8283,13 @@ function wireEvents() {
     const layer = state.layers.find((item) => item.id === row?.dataset.layerId);
     if (!layer || layer.kind !== "adjustment" || state.hoveredAdjustmentLayerId === layer.id) return;
     state.hoveredAdjustmentLayerId = layer.id;
-    renderLayers();
+    syncAdjustmentTargetHighlight(layer.id);
   });
   layerList.addEventListener("pointerleave", () => {
     if (!state.hoveredAdjustmentLayerId) return;
     state.hoveredAdjustmentLayerId = null;
-    renderLayers();
+    const selectedAdjustment = state.layers.find((layer) => layer.id === state.selectedLayerId && layer.kind === "adjustment");
+    syncAdjustmentTargetHighlight(selectedAdjustment?.id || null);
   });
   layerList.addEventListener("contextmenu", (event) => {
     const mask = event.target.closest(".mask-thumb");
@@ -8302,17 +8335,28 @@ function wireEvents() {
     if (event.pointerType === "mouse" || event.target.closest("button, input, .layer-name")) return;
     const row = event.target.closest(".layer-row");
     if (!row) return;
-    layerPress = { pointerId: event.pointerId, layerId: row.dataset.layerId, active: false };
+    layerPress = {
+      pointerId: event.pointerId,
+      layerId: row.dataset.layerId,
+      active: false,
+      startX: event.clientX,
+      startY: event.clientY,
+    };
     layerPress.timer = window.setTimeout(() => {
       if (!layerPress || layerPress.pointerId !== event.pointerId) return;
       layerPress.active = true;
       row.classList.add("touch-dragging");
       layerList.setPointerCapture(event.pointerId);
       if (navigator.vibrate) navigator.vibrate(12);
-    }, 420);
+    }, TOUCH_REORDER_DELAY_MS);
   });
   layerList.addEventListener("pointermove", (event) => {
-    if (!layerPress?.active || layerPress.pointerId !== event.pointerId) return;
+    if (!layerPress || layerPress.pointerId !== event.pointerId) return;
+    if (!layerPress.active && Math.hypot(event.clientX - layerPress.startX, event.clientY - layerPress.startY) > 10) {
+      clearLayerPress();
+      return;
+    }
+    if (!layerPress.active) return;
     event.preventDefault();
     const row = document.elementFromPoint(event.clientX, event.clientY)?.closest(".layer-row");
     if (!row) return;
@@ -8951,17 +8995,28 @@ function wireEvents() {
     if (event.pointerType === "mouse" || event.target.closest("button, input, select, label")) return;
     const card = event.target.closest(".filter-card");
     if (!card) return;
-    filterPress = { pointerId: event.pointerId, filterId: card.dataset.filterId, active: false };
+    filterPress = {
+      pointerId: event.pointerId,
+      filterId: card.dataset.filterId,
+      active: false,
+      startX: event.clientX,
+      startY: event.clientY,
+    };
     filterPress.timer = window.setTimeout(() => {
       if (!filterPress || filterPress.pointerId !== event.pointerId) return;
       filterPress.active = true;
       card.classList.add("touch-dragging");
       filterList.setPointerCapture(event.pointerId);
       if (navigator.vibrate) navigator.vibrate(12);
-    }, 420);
+    }, TOUCH_REORDER_DELAY_MS);
   });
   filterList.addEventListener("pointermove", (event) => {
-    if (!filterPress?.active || filterPress.pointerId !== event.pointerId) return;
+    if (!filterPress || filterPress.pointerId !== event.pointerId) return;
+    if (!filterPress.active && Math.hypot(event.clientX - filterPress.startX, event.clientY - filterPress.startY) > 10) {
+      clearFilterPress();
+      return;
+    }
+    if (!filterPress.active) return;
     event.preventDefault();
     const card = document.elementFromPoint(event.clientX, event.clientY)?.closest(".filter-card");
     if (!card) return;

@@ -35,6 +35,7 @@ body {
   -webkit-user-select: none;
   user-select: none;
   -webkit-touch-callout: none;
+  touch-action: none;
 }
 
 button,
@@ -43,11 +44,17 @@ select {
   font: inherit;
 }
 
-input,
+.layer-name-input,
 textarea,
 [contenteditable="true"] {
   -webkit-user-select: text;
   user-select: text;
+}
+
+input:not(.layer-name-input),
+select {
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 button {
@@ -397,6 +404,15 @@ svg {
     linear-gradient(90deg, rgba(255, 255, 255, 0.012) 1px, transparent 1px),
     radial-gradient(circle at 58% 42%, #272d2d 0, #171b20 38%, #101217 72%);
   background-size: 28px 28px, 28px 28px, auto;
+  touch-action: none;
+}
+
+button,
+input,
+select,
+.layer-row,
+.filter-card {
+  touch-action: manipulation;
 }
 
 .stage-aurora {
