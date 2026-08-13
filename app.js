@@ -404,6 +404,7 @@ const gpu = {
   heightProgram: null,
   maskBrushProgram: null,
   maskTransformProgram: null,
+  maskThumbnailProgram: null,
   paintBrushProgram: null,
   paintTransformProgram: null,
   filterTargets: [],
@@ -1110,6 +1111,64 @@ void main() {
   outColor = vec4(max(color, 0.0), src.a);
 }`;
 
+const MASK_THUMBNAIL_SHADER = `#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 outColor;
+uniform sampler2D uMask;
+uniform sampler2D uBoundMask;
+uniform bool uUseBoundMask;
+uniform float uSoftness;
+uniform float uOpacity;
+uniform float uContrast;
+uniform vec2 uMaskTexel;
+uniform float uRoughenAmount;
+uniform float uRoughenWidth;
+uniform float uRoughenScale;
+uniform float uRoughenSharpness;
+float hash21(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+float noise(vec2 p) {
+  vec2 cell = floor(p);
+  vec2 local = fract(p);
+  vec2 curve = local * local * (3.0 - 2.0 * local);
+  return mix(mix(hash21(cell), hash21(cell + vec2(1.0, 0.0)), curve.x), mix(hash21(cell + vec2(0.0, 1.0)), hash21(cell + vec2(1.0, 1.0)), curve.x), curve.y);
+}
+float rawMaskValue(vec2 uv) {
+  float userValue = texture(uMask, uv).r;
+  if (!uUseBoundMask) return userValue;
+  vec4 bound = texture(uBoundMask, uv);
+  return userValue * dot(bound.rgb, vec3(0.299, 0.587, 0.114)) * bound.a;
+}
+void main() {
+  float value = rawMaskValue(vUv);
+  if (uSoftness > 0.0) {
+    vec2 blurOffset = uMaskTexel * uSoftness * 12.0;
+    value = (
+      rawMaskValue(vUv) * 0.25 +
+      rawMaskValue(vUv + vec2(blurOffset.x, 0.0)) * 0.125 +
+      rawMaskValue(vUv - vec2(blurOffset.x, 0.0)) * 0.125 +
+      rawMaskValue(vUv + vec2(0.0, blurOffset.y)) * 0.125 +
+      rawMaskValue(vUv - vec2(0.0, blurOffset.y)) * 0.125 +
+      rawMaskValue(vUv + blurOffset) * 0.0625 +
+      rawMaskValue(vUv - blurOffset) * 0.0625 +
+      rawMaskValue(vUv + vec2(blurOffset.x, -blurOffset.y)) * 0.0625 +
+      rawMaskValue(vUv + vec2(-blurOffset.x, blurOffset.y)) * 0.0625
+    );
+  }
+  if (uRoughenAmount > 0.0) {
+    vec2 field = vec2(noise(vUv * uRoughenScale + vec2(2.3, 7.1)), noise(vUv * uRoughenScale + vec2(8.6, 3.4))) * 2.0 - 1.0;
+    vec2 roughUv = clamp(vUv + field / max(length(field), 1e-4) * (uRoughenWidth * uMaskTexel), 0.0, 1.0);
+    value = mix(value, rawMaskValue(roughUv), uRoughenAmount);
+    value = pow(clamp(value, 0.0, 1.0), max(0.01, uRoughenSharpness));
+  }
+  value = clamp((value - 0.5) * (1.0 + uContrast * 3.0) + 0.5, 0.0, 1.0) * uOpacity;
+  outColor = vec4(vec3(value), 1.0);
+}`;
+
 const COMPOSITE_SHADER = `#version 300 es
 precision highp float;
 in vec2 vUv;
@@ -1117,10 +1176,12 @@ out vec4 outColor;
 uniform sampler2D uBase;
 uniform sampler2D uLayer;
 uniform sampler2D uMask;
+uniform sampler2D uBoundMask;
 uniform sampler2D uClip;
 uniform float uOpacity;
 uniform int uMode;
 uniform bool uUseMask;
+uniform bool uUseBoundMask;
 uniform bool uMaskEnabled;
 uniform bool uClipDown;
 uniform float uMaskSoftness;
@@ -1184,24 +1245,32 @@ float maskNoise(vec2 p) {
   );
 }
 
+float rawMaskValue(vec2 uv) {
+  float userValue = texture(uMask, uv).r;
+  if (!uUseBoundMask) return userValue;
+  vec4 bound = texture(uBoundMask, uv);
+  float luminance = dot(bound.rgb, vec3(0.299, 0.587, 0.114)) * bound.a;
+  return userValue * luminance;
+}
+
 void main() {
   vec4 base = texture(uBase, vUv);
   vec4 layer = texture(uLayer, vUv);
   float maskValue = 1.0;
   if (uUseMask && uMaskEnabled) {
-    maskValue = texture(uMask, vUv).r;
+    maskValue = rawMaskValue(vUv);
     if (uMaskSoftness > 0.0) {
       vec2 blurOffset = uMaskTexel * uMaskSoftness * 12.0;
       maskValue = (
-        texture(uMask, vUv).r * 0.25 +
-        texture(uMask, vUv + vec2(blurOffset.x, 0.0)).r * 0.125 +
-        texture(uMask, vUv - vec2(blurOffset.x, 0.0)).r * 0.125 +
-        texture(uMask, vUv + vec2(0.0, blurOffset.y)).r * 0.125 +
-        texture(uMask, vUv - vec2(0.0, blurOffset.y)).r * 0.125 +
-        texture(uMask, vUv + blurOffset).r * 0.0625 +
-        texture(uMask, vUv - blurOffset).r * 0.0625 +
-        texture(uMask, vUv + vec2(blurOffset.x, -blurOffset.y)).r * 0.0625 +
-        texture(uMask, vUv + vec2(-blurOffset.x, blurOffset.y)).r * 0.0625
+        rawMaskValue(vUv) * 0.25 +
+        rawMaskValue(vUv + vec2(blurOffset.x, 0.0)) * 0.125 +
+        rawMaskValue(vUv - vec2(blurOffset.x, 0.0)) * 0.125 +
+        rawMaskValue(vUv + vec2(0.0, blurOffset.y)) * 0.125 +
+        rawMaskValue(vUv - vec2(0.0, blurOffset.y)) * 0.125 +
+        rawMaskValue(vUv + blurOffset) * 0.0625 +
+        rawMaskValue(vUv - blurOffset) * 0.0625 +
+        rawMaskValue(vUv + vec2(blurOffset.x, -blurOffset.y)) * 0.0625 +
+        rawMaskValue(vUv + vec2(-blurOffset.x, blurOffset.y)) * 0.0625
       );
     }
     if (uMaskRoughenAmount > 0.0) {
@@ -1211,7 +1280,7 @@ void main() {
       ) * 2.0 - 1.0;
       float fieldLength = max(length(field), 1e-4);
       vec2 roughUv = clamp(vUv + field / fieldLength * (uMaskRoughenWidth * uMaskTexel), 0.0, 1.0);
-      float roughValue = texture(uMask, roughUv).r;
+      float roughValue = rawMaskValue(roughUv);
       maskValue = mix(maskValue, roughValue, uMaskRoughenAmount);
       maskValue = pow(clamp(maskValue, 0.0, 1.0), max(0.01, uMaskRoughenSharpness));
     }
@@ -1642,6 +1711,7 @@ function initializeGpu() {
   gpu.heightProgram = createProgramFromSources(HEIGHT_VERTEX_SHADER, HEIGHT_FRAGMENT_SHADER);
   gpu.maskBrushProgram = createProgram(MASK_BRUSH_SHADER);
   gpu.maskTransformProgram = createProgram(MASK_TRANSFORM_SHADER);
+  gpu.maskThumbnailProgram = createProgram(MASK_THUMBNAIL_SHADER);
   gpu.paintBrushProgram = createProgram(PAINT_BRUSH_SHADER);
   gpu.paintTransformProgram = createProgram(PAINT_TRANSFORM_SHADER);
   rebuildDocumentTargets();
@@ -1679,6 +1749,7 @@ function getInteractiveRenderDimensions() {
 
 function rebuildDocumentTargets(dimensions = getInteractiveRenderDimensions()) {
   state.layers.forEach(destroyLayerFilterCache);
+  state.layers.forEach((layer) => destroyBoundMaskTarget(layer.mask));
   gpu.filterTargets.forEach(destroyTarget);
   destroyTarget(gpu.alphaLockTarget);
   gpu.compositeTargets.forEach(destroyTarget);
@@ -2246,6 +2317,55 @@ const generateAlphaLockPass = {
   `,
 };
 
+function getParameterOffsetSourceLayer(adjustmentLayer, filter) {
+  if (adjustmentLayer.kind !== "adjustment") return null;
+  const adjustmentIndex = state.layers.indexOf(adjustmentLayer);
+  const sourceLayer = state.layers.find((item) => item.id === filter.params.sourceLayerId);
+  const sourceIndex = state.layers.indexOf(sourceLayer);
+  if (!sourceLayer || sourceIndex < 0 || sourceIndex >= adjustmentIndex) return null;
+  if (hasCustomAdjustmentStart(adjustmentLayer)) {
+    const rangeEndIndex = state.layers.indexOf(getAdjustmentStartLayer(adjustmentLayer));
+    if (sourceIndex > rangeEndIndex) return null;
+  }
+  return sourceLayer;
+}
+
+function getParameterOffsetSourceFilter(adjustmentLayer, filter) {
+  const sourceLayer = getParameterOffsetSourceLayer(adjustmentLayer, filter);
+  const sourceFilter = sourceLayer?.filters.find((item) => item.id === filter.params.sourceFilterId);
+  if (!sourceFilter || sourceFilter.defId === "parameterOffset") return null;
+  return sourceFilter;
+}
+
+function clampFilterParam(value, param) {
+  if (!Number.isFinite(value)) return value;
+  return Math.max(param.min ?? value, Math.min(param.max ?? value, value));
+}
+
+function resolveParameterOffsetFilter(layer, filter) {
+  const sourceLayer = getParameterOffsetSourceLayer(layer, filter);
+  const sourceFilter = getParameterOffsetSourceFilter(layer, filter);
+  if (!sourceFilter?.enabled || sourceLayer?.filtersEnabled === false) return null;
+  const def = FILTER_DEFS.find((item) => item.id === sourceFilter.defId);
+  if (!def) return null;
+  const params = cloneHistoryValue(sourceFilter.params);
+  const overrides = filter.params.overrides || {};
+  for (const [key, override] of Object.entries(overrides)) {
+    const param = def.params.find((item) => item.key === key);
+    if (!param) continue;
+    const sourceValue = sourceFilter.params[key];
+    params[key] = filter.params.relative && typeof sourceValue === "number" && typeof override === "number"
+      ? clampFilterParam(sourceValue + override, param)
+      : typeof override === "number" ? clampFilterParam(override, param) : cloneHistoryValue(override);
+  }
+  return {
+    ...sourceFilter,
+    id: filter.id,
+    defId: def.id,
+    params,
+  };
+}
+
 function renderLayerFilters(layer, timeSeconds, sourceOverride = null, options = {}) {
   let source = sourceOverride || layer.sourceTexture;
   const penetrationSource = options.penetrationSource || gpu.transparentTexture;
@@ -2253,7 +2373,11 @@ function renderLayerFilters(layer, timeSeconds, sourceOverride = null, options =
   // Cards are stored and displayed top-to-bottom. Apply from the bottom card
   // upward so a newly added filter at the top is the final operation.
   const activeFilters = layer.filtersEnabled !== false
-    ? layer.filters.filter((filter) => filter.enabled).reverse()
+    ? layer.filters
+      .filter((filter) => filter.enabled)
+      .map((filter) => filter.defId === "parameterOffset" ? resolveParameterOffsetFilter(layer, filter) : filter)
+      .filter(Boolean)
+      .reverse()
     : [];
   if (!activeFilters.length) return source;
   const animated = state.paintPointerId === null && activeFilters.some((filter) => filterUsesMotion(filter));
@@ -2324,6 +2448,66 @@ function renderLayerFilters(layer, timeSeconds, sourceOverride = null, options =
     return layer.filterCache.target.texture;
   }
   return source;
+}
+
+const resolvingBoundMaskLayerIds = new Set();
+
+function ensureBoundMaskTarget(mask) {
+  if (mask.boundTarget?.width === gpu.renderWidth && mask.boundTarget?.height === gpu.renderHeight) {
+    return mask.boundTarget;
+  }
+  destroyBoundMaskTarget(mask);
+  mask.boundTarget = createTarget(gpu.renderWidth, gpu.renderHeight);
+  mask.boundTarget.width = gpu.renderWidth;
+  mask.boundTarget.height = gpu.renderHeight;
+  return mask.boundTarget;
+}
+
+function destroyBoundMaskTarget(mask) {
+  if (mask?.boundTarget) destroyTarget(mask.boundTarget);
+  if (mask) mask.boundTarget = null;
+}
+
+function renderBoundMaskTexture(layer) {
+  const boundLayer = layer.mask?.boundLayerId
+    ? state.layers.find((candidate) => candidate.id === layer.mask.boundLayerId)
+    : null;
+  if (!boundLayer || boundLayer === layer || resolvingBoundMaskLayerIds.has(layer.id)) return null;
+  resolvingBoundMaskLayerIds.add(layer.id);
+  try {
+    ensureLayerGpuTextures(boundLayer);
+    if (!boundLayer.sourceTexture) return null;
+    const boundIndex = state.layers.indexOf(boundLayer);
+    const isAdjustment = boundLayer.kind === "adjustment";
+    const isMaterial = boundLayer.kind === "material";
+    const isHeight = boundLayer.kind === "height";
+    const background = (isAdjustment || isMaterial || isHeight)
+      ? renderNormalCompositeBefore(boundIndex, gpu.rangeCompositeTargets)
+      : null;
+    const materialTexture = isMaterial ? renderMaterialLayer(boundLayer, background.texture) : null;
+    const heightTexture = isHeight ? renderHeightLayer(boundLayer, background.texture) : null;
+    const adjustmentStart = isAdjustment ? getAdjustmentStartLayer(boundLayer) : null;
+    const adjustmentSource = adjustmentStart && hasCustomAdjustmentStart(boundLayer)
+      ? renderNormalCompositeBefore(state.layers.indexOf(adjustmentStart) + 1, gpu.rangeCompositeTargets)
+      : background;
+    const source = renderLayerFilters(
+      boundLayer,
+      state.motionTime,
+      isAdjustment ? adjustmentSource?.texture : (materialTexture || heightTexture),
+      (isAdjustment || layerUsesDerivativeDisplacement(boundLayer))
+        ? { penetrationSource: isAdjustment ? adjustmentSource?.texture : background?.texture }
+        : undefined,
+    );
+    const target = ensureBoundMaskTarget(layer.mask);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, target.framebuffer);
+    gl.viewport(0, 0, gpu.renderWidth, gpu.renderHeight);
+    gl.useProgram(gpu.displayProgram);
+    bindTexture(gpu.displayProgram, "uSource", source, 0);
+    drawFullscreen();
+    return target.texture;
+  } finally {
+    resolvingBoundMaskLayerIds.delete(layer.id);
+  }
 }
 
 function layerUsesDerivativeDisplacement(layer) {
@@ -2421,6 +2605,7 @@ function renderDocument(forcedSize = null) {
     const transformPreview = state.paintTransformStroke?.layerId === layer.id
       ? state.paintTransformStroke.previewTexture
       : null;
+    const boundMaskTexture = renderBoundMaskTexture(layer);
     const materialTexture = isMaterial ? renderMaterialLayer(layer, baseTexture) : null;
     const heightTexture = isHeight
       ? renderHeightLayer(layer, baseTexture, transformPreview || layer.sourceTexture)
@@ -2448,9 +2633,10 @@ function renderDocument(forcedSize = null) {
     bindTexture(gpu.compositeProgram, "uLayer", layerTexture, 1);
     const visibleMask = state.transformStroke?.layerId === layer.id
       ? state.transformStroke.previewMask
-      : getBoundMask(layer);
+      : layer.mask;
     bindTexture(gpu.compositeProgram, "uMask", visibleMask?.texture || gpu.whiteMask, 2);
     bindTexture(gpu.compositeProgram, "uClip", previousLayerTexture, 3);
+    bindTexture(gpu.compositeProgram, "uBoundMask", boundMaskTexture || gpu.whiteMask, 4);
     gl.uniform1f(gl.getUniformLocation(gpu.compositeProgram, "uOpacity"), layer.opacity);
     const blendModeId = layer.id === state.selectedLayerId && state.blendPreviewMode !== null
       ? state.blendPreviewMode
@@ -2460,6 +2646,7 @@ function renderDocument(forcedSize = null) {
       BLEND_MODE_CODES[blendModeId] ?? 0,
     );
     gl.uniform1i(gl.getUniformLocation(gpu.compositeProgram, "uUseMask"), visibleMask ? 1 : 0);
+    gl.uniform1i(gl.getUniformLocation(gpu.compositeProgram, "uUseBoundMask"), boundMaskTexture ? 1 : 0);
     gl.uniform1i(gl.getUniformLocation(gpu.compositeProgram, "uMaskEnabled"), visibleMask?.enabled ? 1 : 0);
     gl.uniform1f(gl.getUniformLocation(gpu.compositeProgram, "uMaskSoftness"), visibleMask?.softness ?? 0);
     gl.uniform1f(gl.getUniformLocation(gpu.compositeProgram, "uMaskOpacity"), visibleMask?.opacity ?? 1);
@@ -2581,7 +2768,7 @@ function createMask(fillValue = 255) {
     roughenWidth: 8,
     roughenScale: 24,
     roughenSharpness: 1,
-    bindLayerId: null,
+    boundLayerId: null,
   };
   createMaskGpuTextures(mask, data);
   return mask;
@@ -2590,6 +2777,14 @@ function createMask(fillValue = 255) {
 function defaultFilterParams(defId) {
   const def = FILTER_DEFS.find((item) => item.id === defId);
   if (!def) throw new Error(`Unknown filter type: ${defId}`);
+  if (defId === "parameterOffset") {
+    return {
+      sourceLayerId: null,
+      sourceFilterId: null,
+      relative: true,
+      overrides: {},
+    };
+  }
   const params = defaultParamsFor(defId);
   if (def.group === "Generate") params.alphaLock = false;
   return params;
@@ -2980,17 +3175,11 @@ function createLayerFromSourceCanvas(sourceCanvas, name, options = {}) {
     layer.mask.roughenWidth = options.maskRoughenWidth ?? 8;
     layer.mask.roughenScale = options.maskRoughenScale ?? 24;
     layer.mask.roughenSharpness = options.maskRoughenSharpness ?? 1;
-    layer.mask.bindLayerId = options.maskBindLayerId ?? null;
+    layer.mask.boundLayerId = options.maskBoundLayerId ?? options.maskBindLayerId ?? null;
     uploadFullMask(layer.mask);
   }
-
+  if (layer.mask) layer.mask.boundLayerId = options.maskBoundLayerId ?? options.maskBindLayerId ?? null;
   return layer;
-}
-
-function getBoundMask(layer) {
-  if (!layer.mask?.bindLayerId) return layer.mask;
-  const boundLayer = state.layers.find((candidate) => candidate.id === layer.mask?.bindLayerId);
-  return boundLayer?.mask || layer.mask;
 }
 
 async function createLayerFromImage(url, name, options = {}) {
@@ -3015,6 +3204,7 @@ function destroyLayerGpu(layer) {
   if (layer.mask?.scratchTexture) gl.deleteTexture(layer.mask.scratchTexture);
   if (layer.mask?.framebuffer) gl.deleteFramebuffer(layer.mask.framebuffer);
   if (layer.mask?.scratchFramebuffer) gl.deleteFramebuffer(layer.mask.scratchFramebuffer);
+  destroyBoundMaskTarget(layer.mask);
   ["_colorMapTexture", "_normalMapTexture", "_roughnessMapTexture", "_metalnessMapTexture"].forEach((key) => {
     if (layer[key]) gl.deleteTexture(layer[key]);
   });
@@ -4190,12 +4380,14 @@ function beginStroke(event) {
     return;
   }
   if (!mask.initialized) {
-    const reveal = state.brush.value >= 0.5;
+    const reveal = !mask.boundLayerId && state.brush.value >= 0.5;
     state.strokeHistory.initializedFillValue = reveal ? 0 : 255;
     mask.data.fill(reveal ? 0 : 255);
     mask.initialized = true;
     fillMaskGpu(mask, reveal ? 0 : 255);
-    showToast(reveal ? "Mask initialized to black, then revealed." : "Mask initialized to white, then hidden.");
+    if (!mask.boundLayerId) {
+      showToast(reveal ? "Mask initialized to black, then revealed." : "Mask initialized to white, then hidden.");
+    }
   }
 
   if (state.brush.mode === "normal") {
@@ -4695,7 +4887,46 @@ function eyeSvg(visible) {
     : '<svg viewBox="0 0 20 20"><path d="M3.1 7.4A9 9 0 0 0 2.2 10s2.7 4.8 7.8 4.8c1.4 0 2.6-.3 3.6-.8M6.2 5.9A8.5 8.5 0 0 1 10 5.2c5.1 0 7.8 4.8 7.8 4.8a10 10 0 0 1-1.4 2.1M3 3l14 14"/></svg>';
 }
 
-function maskThumbnail(mask) {
+function boundMaskThumbnail(layer) {
+  const mask = layer.mask;
+  const boundMaskTexture = renderBoundMaskTexture(layer);
+  if (!boundMaskTexture) return null;
+  const target = gpu.thumbnailTarget;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, target.framebuffer);
+  gl.viewport(0, 0, 64, 64);
+  gl.useProgram(gpu.maskThumbnailProgram);
+  bindTexture(gpu.maskThumbnailProgram, "uMask", mask.texture, 0);
+  bindTexture(gpu.maskThumbnailProgram, "uBoundMask", boundMaskTexture, 1);
+  gl.uniform1i(gl.getUniformLocation(gpu.maskThumbnailProgram, "uUseBoundMask"), 1);
+  gl.uniform1f(gl.getUniformLocation(gpu.maskThumbnailProgram, "uSoftness"), mask.softness);
+  gl.uniform1f(gl.getUniformLocation(gpu.maskThumbnailProgram, "uOpacity"), mask.opacity);
+  gl.uniform1f(gl.getUniformLocation(gpu.maskThumbnailProgram, "uContrast"), mask.contrast);
+  gl.uniform2f(gl.getUniformLocation(gpu.maskThumbnailProgram, "uMaskTexel"), 1 / DOC_WIDTH, 1 / DOC_HEIGHT);
+  gl.uniform1f(gl.getUniformLocation(gpu.maskThumbnailProgram, "uRoughenAmount"), mask.roughenAmount);
+  gl.uniform1f(gl.getUniformLocation(gpu.maskThumbnailProgram, "uRoughenWidth"), mask.roughenWidth);
+  gl.uniform1f(gl.getUniformLocation(gpu.maskThumbnailProgram, "uRoughenScale"), mask.roughenScale);
+  gl.uniform1f(gl.getUniformLocation(gpu.maskThumbnailProgram, "uRoughenSharpness"), mask.roughenSharpness);
+  drawFullscreen();
+  const pixels = new Uint8Array(64 * 64 * 4);
+  gl.readPixels(0, 0, 64, 64, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+  const preview = document.createElement("canvas");
+  preview.width = 64;
+  preview.height = 64;
+  const context = preview.getContext("2d");
+  const image = context.createImageData(64, 64);
+  for (let y = 0; y < 64; y += 1) {
+    image.data.set(pixels.subarray((63 - y) * 64 * 4, (64 - y) * 64 * 4), y * 64 * 4);
+  }
+  context.putImageData(image, 0, 0);
+  return preview.toDataURL("image/png");
+}
+
+function maskThumbnail(layer) {
+  const mask = layer.mask;
+  if (mask.boundLayerId) {
+    const thumbnail = boundMaskThumbnail(layer);
+    if (thumbnail) return thumbnail;
+  }
   const size = 32;
   const preview = document.createElement("canvas");
   preview.width = size;
@@ -4755,6 +4986,9 @@ function renderLayers() {
   const linkedTargetId = linkedAdjustment && hasCustomAdjustmentStart(linkedAdjustment)
     ? linkedAdjustment.adjustmentStartLayerId
     : null;
+  const boundLayerIds = new Set(state.layers
+    .map((layer) => layer.mask?.boundLayerId)
+    .filter(Boolean));
   layerList.innerHTML = displayLayers.map((layer) => {
     const selected = layer.id === state.selectedLayerId;
     const maskActive = selected && state.selectionPart === "mask";
@@ -4764,10 +4998,12 @@ function renderLayers() {
       || layer.mask.opacity !== 1
       || layer.mask.contrast !== 0
       || layer.mask.roughenAmount !== 0
+      || layer.mask.boundLayerId
     );
     const maskDisabled = layer.mask && !layer.mask.enabled;
+    const boundSource = boundLayerIds.has(layer.id);
     const maskMarkup = layer.mask
-      ? `<button class="mask-thumb ${maskActive ? "active" : ""} ${maskAdjusted ? "adjusted" : ""} ${maskDisabled ? "disabled" : ""}" data-select-part="mask" style="background-image:url('${maskThumbnail(layer.mask)}')" title="${maskDisabled ? "Mask disabled — click to select" : "Paint layer mask"}"></button>`
+      ? `<button class="mask-thumb ${maskActive ? "active" : ""} ${maskAdjusted ? "adjusted" : ""} ${maskDisabled ? "disabled" : ""} ${layer.mask.boundLayerId ? "bound" : ""}" data-select-part="mask" style="background-image:url('${maskThumbnail(layer)}')" title="${maskDisabled ? "Mask disabled — click to select" : "Paint layer mask"}"></button>`
       : "";
     return `
       <article class="layer-row ${selected ? "selected" : ""} ${layer.visible ? "visible" : ""} ${layer.clipDown ? "clipped-down" : ""} ${layer.id === linkedTargetId ? "adjustment-target" : ""}" draggable="true" data-layer-id="${layer.id}">
@@ -4784,7 +5020,7 @@ function renderLayers() {
           ${maskMarkup}
         </div>
         <div class="layer-copy" data-select-part="${selectionPart}">
-          <span class="layer-name">${escapeHtml(layer.name)}</span>
+          <span class="layer-name">${escapeHtml(layer.name)}${boundSource ? `<svg class="bound-layer-icon" viewBox="0 0 20 20" aria-label="Used by a bound mask"><path d="M7.5 12.5 12.5 7.5"/><path d="M6.2 14.8 4.8 16.2a3 3 0 0 1-4.2-4.2l3.1-3.1a3 3 0 0 1 4.2 0"/><path d="m13.8 5.2 1.4-1.4a3 3 0 0 1 4.2 4.2l-3.1 3.1a3 3 0 0 1-4.2 0"/></svg>` : ""}</span>
           ${selected ? `<div class="layer-badges">
             <button class="layer-badge ${layer.clipDown ? "active" : ""}" data-layer-status="clip" title="Toggle clip down">Clip</button>
             <button class="layer-badge ${layer.alphaLock ? "active" : ""}" data-layer-status="alpha" title="Toggle alpha lock">Alpha</button>
@@ -5001,7 +5237,7 @@ async function duplicateLayer(layer) {
     maskRoughenWidth: layer.mask?.roughenWidth,
     maskRoughenScale: layer.mask?.roughenScale,
     maskRoughenSharpness: layer.mask?.roughenSharpness,
-    maskBindLayerId: layer.mask?.bindLayerId,
+    maskBoundLayerId: layer.mask?.boundLayerId,
     filters: layer.filters.map((filter) => ({
       ...filter,
       id: uid("filter"),
@@ -5164,6 +5400,7 @@ function handleLayerMenuAction(layer, action) {
       softness: source.softness,
       opacity: source.opacity,
       contrast: source.contrast,
+      boundLayerId: source.boundLayerId,
     };
     showToast("Mask copied.");
   } else if (action === "mask-paste" && state.maskClipboard) {
@@ -5175,7 +5412,9 @@ function handleLayerMenuAction(layer, action) {
     pasted.softness = source.softness;
     pasted.opacity = source.opacity;
     pasted.contrast = source.contrast;
+    pasted.boundLayerId = source.boundLayerId || null;
     uploadFullMask(pasted);
+    if (layer.mask) destroyBoundMaskTarget(layer.mask);
     if (layer.mask) gl.deleteTexture(layer.mask.texture);
     layer.mask = pasted;
     state.selectionPart = "mask";
@@ -5186,8 +5425,11 @@ function handleLayerMenuAction(layer, action) {
     state.selectedLayerId = layer.id;
     state.selectionPart = "mask";
     documentChanged = true;
-    showToast("Mask cleared. The first brush stroke will choose its black or white base.");
+    showToast(layer.mask.boundLayerId
+      ? "Brush edits cleared. The bound layer remains active."
+      : "Mask cleared. The first brush stroke will choose its black or white base.");
   } else if (action === "mask-delete" && layer.mask) {
+    destroyBoundMaskTarget(layer.mask);
     gl.deleteTexture(layer.mask.texture);
     layer.mask = null;
     state.selectionPart = "content";
@@ -5257,7 +5499,11 @@ function getOrderedFilterGroups() {
 }
 
 function getOrderedFiltersForGroup(group) {
-  const definitions = FILTER_DEFS.filter((def) => def.group === group);
+  const selectedLayer = getSelectedLayer();
+  const definitions = FILTER_DEFS.filter((def) => (
+    def.group === group
+    && (!def.adjustmentOnly || selectedLayer?.kind === "adjustment")
+  ));
   const ids = normalizeMenuOrder(definitions.map((def) => def.id), state.filterMenuFilterOrders[group]);
   return ids.map((id) => definitions.find((def) => def.id === id));
 }
@@ -5530,6 +5776,84 @@ function renderFilterToggle(filter, param) {
     </label>`;
 }
 
+function getParameterOffsetLayerChoices(adjustmentLayer) {
+    const adjustmentIndex = state.layers.indexOf(adjustmentLayer);
+    const rangeEndIndex = hasCustomAdjustmentStart(adjustmentLayer)
+      ? state.layers.indexOf(getAdjustmentStartLayer(adjustmentLayer))
+      : adjustmentIndex - 1;
+    return state.layers
+      .slice(0, Math.max(0, rangeEndIndex + 1))
+      .filter((layer) => layer.filters.some((filter) => filter.defId !== "parameterOffset"));
+}
+
+function renderParameterOffsetParams(layer, filter) {
+    const sourceLayers = getParameterOffsetLayerChoices(layer);
+    const sourceLayer = getParameterOffsetSourceLayer(layer, filter);
+    const sourceFilters = sourceLayer?.filters.filter((item) => item.defId !== "parameterOffset") || [];
+    const sourceFilter = getParameterOffsetSourceFilter(layer, filter);
+    const sourceDef = sourceFilter && FILTER_DEFS.find((item) => item.id === sourceFilter.defId);
+    const resolvedFilter = sourceFilter ? resolveParameterOffsetFilter(layer, filter) : null;
+    const overrides = filter.params.overrides || {};
+    const numericParams = sourceDef?.params.filter((param) => (
+      param.type === undefined
+      && shouldShowFilterParam(param, resolvedFilter?.params || sourceFilter.params)
+    )) || [];
+    const inheritedParams = sourceDef?.params.filter((param) => param.type !== undefined) || [];
+    const controls = numericParams.map((param) => {
+      const overridden = Object.prototype.hasOwnProperty.call(overrides, param.key);
+      const sourceValue = Number(sourceFilter.params[param.key]);
+      const value = overridden
+        ? Number(overrides[param.key])
+        : filter.params.relative ? 0 : sourceValue;
+      const min = filter.params.relative ? Number(param.min) - sourceValue : param.min;
+      const max = filter.params.relative ? Number(param.max) - sourceValue : param.max;
+      return `
+        <div class="control-row parameter-offset-control ${overridden ? "overridden" : "inherited"}">
+          <label>${escapeHtml(param.label)}</label>
+          <input type="range" min="${min}" max="${max}" step="${param.step}" value="${value}" data-parameter-offset-param="${param.key}" />
+          <input type="number" min="${min}" max="${max}" step="${param.step}" value="${value}" data-parameter-offset-number="${param.key}" />
+          <button type="button" class="parameter-offset-reset" data-parameter-offset-reset="${param.key}"
+            title="${overridden ? "Reset to inherited value" : "Following source value"}" ${overridden ? "" : "disabled"}>↺</button>
+        </div>`;
+    }).join("");
+    return `
+      <div class="parameter-offset-settings">
+        <div class="control-row filter-select-row">
+          <label>Layer</label>
+          <select data-parameter-offset-layer>
+            <option value="">Choose layer</option>
+            ${sourceLayers.map((candidate) => `
+              <option value="${candidate.id}" ${candidate.id === sourceLayer?.id ? "selected" : ""}>${escapeHtml(candidate.name)}</option>`).join("")}
+          </select>
+        </div>
+        <div class="control-row filter-select-row">
+          <label>Filter</label>
+          <select data-parameter-offset-filter ${sourceLayer ? "" : "disabled"}>
+            <option value="">Choose filter</option>
+            ${sourceFilters.map((candidate) => {
+              const def = FILTER_DEFS.find((item) => item.id === candidate.defId);
+              return `<option value="${candidate.id}" ${candidate.id === sourceFilter?.id ? "selected" : ""}>${escapeHtml(def?.label || candidate.defId)}</option>`;
+            }).join("")}
+          </select>
+        </div>
+        <label class="filter-toggle-row">
+          <span>Relative offset</span>
+          <input type="checkbox" data-parameter-offset-relative ${filter.params.relative ? "checked" : ""} ${sourceDef ? "" : "disabled"} />
+          <i></i>
+        </label>
+        ${sourceDef ? `
+          <div class="parameter-offset-source-title">
+            <b>${escapeHtml(sourceDef.label)}</b>
+            <small>${filter.params.relative ? "Values are added to the source." : "Changed values replace the source."}</small>
+          </div>
+          ${controls || '<p class="parameter-offset-note">This filter has no numeric parameters to offset.</p>'}
+          ${inheritedParams.length
+            ? `<p class="parameter-offset-note">Non-numeric settings (${inheritedParams.map((param) => escapeHtml(param.label)).join(", ")}) remain linked to the source.</p>`
+            : ""}
+        ` : `<p class="parameter-offset-note">${filter.params.sourceFilterId ? "The linked filter is unavailable or outside this adjustment range." : "Choose a layer and filter to expose its numeric parameters."}</p>`}
+      </div>`;
+}
+
 function renderFilterCards(layer) {
   return layer.filters.map((filter) => {
     const def = FILTER_DEFS.find((item) => item.id === filter.defId);
@@ -5540,7 +5864,9 @@ function renderFilterCards(layer) {
         { key: "alphaLock", label: "Alpha Lock", type: "toggle" },
       ]
       : [];
-    const params = [
+    const params = filter.defId === "parameterOffset"
+      ? renderParameterOffsetParams(layer, filter)
+      : [
       ...(def.group === "Generate"
         ? def.params.filter((param) => param.type !== "toggle")
         : def.params
@@ -5548,7 +5874,7 @@ function renderFilterCards(layer) {
       generatorToggles.length
         ? `<div class="filter-toggle-group">${generatorToggles.map((param) => renderFilterToggle(filter, param)).join("")}</div>`
         : "",
-    ].join("");
+      ].join("");
     return `
       <article class="filter-card ${filter.enabled ? "" : "disabled"} ${filter.collapsed ? "collapsed" : ""}" data-filter-id="${filter.id}">
         <div class="filter-head">
@@ -5794,21 +6120,23 @@ function renderFilters() {
     ? "Post filters run after material lighting, from bottom to top. Drag to reorder."
     : "Filters run from bottom to top. Drag to reorder.";
   if (showMaskSettings) {
-    const boundLayerId = mask.bindLayerId || "";
-    const bindChoices = state.layers
-      .filter((candidate) => candidate.id !== layer.id && candidate.mask)
-      .map((candidate) => `<option value="${candidate.id}" ${candidate.id === boundLayerId ? "selected" : ""}>${escapeHtml(candidate.name)}</option>`)
-      .join("");
+    const boundLayer = state.layers.find((candidate) => candidate.id === mask.boundLayerId);
     filterList.innerHTML = `
       <section class="mask-settings-card">
-        <p>Controls the selected layer mask without changing its painted pixels.</p>
-        <div class="control-row">
-          <label>Bind layer</label>
-          <select data-mask-bind-layer>
-            <option value="" ${boundLayerId ? "" : "selected"}>This layer</option>
-            ${bindChoices}
+        <div class="mask-bind-setting">
+          <div>
+            <b>Bind layer</b>
+            <small>Uses the layer's live luminance beneath brush edits.</small>
+          </div>
+          <select data-mask-bind-layer aria-label="Bind mask to layer">
+            <option value="">None</option>
+            ${state.layers.filter((candidate) => candidate !== layer).map((candidate) => `
+              <option value="${candidate.id}" ${candidate.id === boundLayer?.id ? "selected" : ""}>${escapeHtml(candidate.name)}</option>
+            `).join("")}
           </select>
         </div>
+        <div class="mask-settings-divider"></div>
+        <p>Controls the selected layer mask without changing its painted pixels.</p>
         ${renderMaskSetting("Softness", "softness", mask.softness, 0, 1, 0.01)}
         ${renderMaskSetting("Opacity", "opacity", mask.opacity, 0, 1, 0.01)}
         ${renderMaskSetting("Contrast", "contrast", mask.contrast, -1, 1, 0.01)}
@@ -5838,6 +6166,11 @@ function renderMaskSetting(label, key, value, min, max, step) {
 function addFilter(defId) {
   const layer = getSelectedLayer();
   if (!layer) return;
+  const def = FILTER_DEFS.find((item) => item.id === defId);
+  if (!def || (def.adjustmentOnly && layer.kind !== "adjustment")) {
+    showToast("Parameter Offset is only available on adjustment layers.");
+    return;
+  }
   layer.filters.unshift(createFilter(defId));
   invalidateLayerThumbnail(layer);
   renderFilters();
@@ -6904,7 +7237,7 @@ function captureHistorySnapshot() {
         roughenWidth: layer.mask.roughenWidth,
         roughenScale: layer.mask.roughenScale,
         roughenSharpness: layer.mask.roughenSharpness,
-        bindLayerId: layer.mask.bindLayerId,
+        boundLayerId: layer.mask.boundLayerId,
       } : null,
       filters: layer.filters.map((filter) => ({
         id: filter.id,
@@ -7033,7 +7366,7 @@ async function restoreHistorySnapshot(snapshot) {
         maskRoughenWidth: item.mask?.roughenWidth,
         maskRoughenScale: item.mask?.roughenScale,
         maskRoughenSharpness: item.mask?.roughenSharpness,
-        maskBindLayerId: item.mask?.bindLayerId,
+        maskBoundLayerId: item.mask?.boundLayerId ?? item.mask?.bindLayerId,
         filters: item.filters.map((filter) => ({
           ...filter,
           params: cloneHistoryValue(filter.params),
@@ -7257,7 +7590,7 @@ function serializeDocument({ includeBinary = true } = {}) {
         roughenWidth: layer.mask.roughenWidth,
         roughenScale: layer.mask.roughenScale,
         roughenSharpness: layer.mask.roughenSharpness,
-        bindLayerId: layer.mask.bindLayerId,
+        boundLayerId: layer.mask.boundLayerId,
         image: includeBinary ? encodeMask(layer.mask) : null,
       } : null,
       filters: layer.filters.map((filter) => ({
@@ -7573,7 +7906,7 @@ async function applyStoredDocument(stored) {
         maskRoughenWidth: item.mask?.roughenWidth,
         maskRoughenScale: item.mask?.roughenScale,
         maskRoughenSharpness: item.mask?.roughenSharpness,
-        maskBindLayerId: item.mask?.bindLayerId,
+        maskBoundLayerId: item.mask?.boundLayerId ?? item.mask?.bindLayerId,
         filters: Array.isArray(item.filters)
           ? item.filters.map(normalizeStoredFilter).filter(Boolean)
           : [],
@@ -7751,7 +8084,7 @@ function clearCompositeTarget(index, targets = gpu.compositeTargets) {
   return target;
 }
 
-function compositeNormalLayer(baseTexture, layerTexture, layer, target) {
+function compositeNormalLayer(baseTexture, layerTexture, layer, target, boundMaskTexture = null) {
   gl.bindFramebuffer(gl.FRAMEBUFFER, target.framebuffer);
   gl.viewport(0, 0, gpu.renderWidth, gpu.renderHeight);
   gl.useProgram(gpu.compositeProgram);
@@ -7759,9 +8092,11 @@ function compositeNormalLayer(baseTexture, layerTexture, layer, target) {
   bindTexture(gpu.compositeProgram, "uLayer", layerTexture, 1);
   bindTexture(gpu.compositeProgram, "uMask", layer.mask?.texture || gpu.whiteMask, 2);
   bindTexture(gpu.compositeProgram, "uClip", gpu.whiteMask, 3);
+  bindTexture(gpu.compositeProgram, "uBoundMask", boundMaskTexture || gpu.whiteMask, 4);
   gl.uniform1f(gl.getUniformLocation(gpu.compositeProgram, "uOpacity"), layer.opacity);
   gl.uniform1i(gl.getUniformLocation(gpu.compositeProgram, "uMode"), BLEND_MODE_CODES[layer.blendMode] ?? 0);
   gl.uniform1i(gl.getUniformLocation(gpu.compositeProgram, "uUseMask"), layer.mask ? 1 : 0);
+  gl.uniform1i(gl.getUniformLocation(gpu.compositeProgram, "uUseBoundMask"), boundMaskTexture ? 1 : 0);
   gl.uniform1i(gl.getUniformLocation(gpu.compositeProgram, "uMaskEnabled"), layer.mask?.enabled ? 1 : 0);
   gl.uniform1f(gl.getUniformLocation(gpu.compositeProgram, "uMaskSoftness"), layer.mask?.softness ?? 0);
   gl.uniform1f(gl.getUniformLocation(gpu.compositeProgram, "uMaskOpacity"), layer.mask?.opacity ?? 1);
@@ -7787,6 +8122,7 @@ function renderNormalCompositeBefore(endIndex, targets = gpu.rangeCompositeTarge
     const isAdjustment = layer.kind === "adjustment";
     const isMaterial = layer.kind === "material";
     const isHeight = layer.kind === "height";
+    const boundMaskTexture = renderBoundMaskTexture(layer);
     const materialTexture = isMaterial ? renderMaterialLayer(layer, base.texture) : null;
     const heightTexture = isHeight ? renderHeightLayer(layer, base.texture) : null;
     const layerTexture = renderLayerFilters(
@@ -7798,7 +8134,7 @@ function renderNormalCompositeBefore(endIndex, targets = gpu.rangeCompositeTarge
         : undefined,
     );
     const targetIndex = 1 - baseIndex;
-    base = compositeNormalLayer(base.texture, layerTexture, layer, targets[targetIndex]);
+    base = compositeNormalLayer(base.texture, layerTexture, layer, targets[targetIndex], boundMaskTexture);
     baseIndex = targetIndex;
   }
   return base;
@@ -7807,6 +8143,7 @@ function renderNormalCompositeBefore(endIndex, targets = gpu.rangeCompositeTarge
 function renderLayerExportTarget(layerIndex) {
   const layer = state.layers[layerIndex];
   ensureLayerGpuTextures(layer);
+  const boundMaskTexture = renderBoundMaskTexture(layer);
   const background = renderNormalCompositeBefore(layerIndex);
   const isAdjustment = layer.kind === "adjustment";
   const isMaterial = layer.kind === "material";
@@ -7828,7 +8165,7 @@ function renderLayerExportTarget(layerIndex) {
   );
   const transparentIndex = background === gpu.compositeTargets[0] ? 1 : 0;
   const transparent = clearCompositeTarget(transparentIndex);
-  return compositeNormalLayer(transparent.texture, layerTexture, layer, background);
+  return compositeNormalLayer(transparent.texture, layerTexture, layer, background, boundMaskTexture);
 }
 
 function targetToPngDataUrl(target) {
@@ -8785,6 +9122,7 @@ function wireEvents() {
     const openMaterialMapSet = event.target.closest("[data-material-open-map-set]");
     const openMaterialLibraryButton = event.target.closest("[data-material-open-library]");
     const resetMaterialLight = event.target.closest("[data-material-reset-light]");
+    const parameterOffsetReset = event.target.closest("[data-parameter-offset-reset]");
     const action = event.target.closest("[data-filter-action]")?.dataset.filterAction;
     const layer = getSelectedLayer();
     const filter = layer?.filters.find((item) => item.id === card?.dataset.filterId);
@@ -8869,6 +9207,16 @@ function wireEvents() {
     }
 
     if (!filter) return;
+    if (parameterOffsetReset && filter.defId === "parameterOffset") {
+      const key = parameterOffsetReset.dataset.parameterOffsetReset;
+      delete filter.params.overrides[key];
+      invalidateLayerThumbnail(layer);
+      renderFilters();
+      renderLayers();
+      requestRender();
+      commitDocumentAction();
+      return;
+    }
     if (clearImageKey) {
       filter.params[clearImageKey] = null;
       invalidateLayerThumbnail(layer);
@@ -8899,6 +9247,8 @@ function wireEvents() {
       target.dataset.filterParam
       || target.dataset.filterNumber
       || target.dataset.filterValue
+      || target.dataset.parameterOffsetParam
+      || target.dataset.parameterOffsetNumber
       || target.dataset.gradientParam
       || target.dataset.curveParam
     )) return;
@@ -8966,6 +9316,20 @@ function wireEvents() {
   filterList.addEventListener("pointercancel", (event) => finishGradientStopDrag(event, true));
 
   filterList.addEventListener("input", (event) => {
+    if ("maskBindLayer" in event.target.dataset) {
+      const layer = getSelectedLayer();
+      if (!layer?.mask) return;
+      const boundLayerId = event.target.value || null;
+      if (boundLayerId === layer.id || (boundLayerId && !state.layers.some((candidate) => candidate.id === boundLayerId))) return;
+      layer.mask.boundLayerId = boundLayerId;
+      destroyBoundMaskTarget(layer.mask);
+      renderLayers();
+      renderFilters();
+      requestRender();
+      commitDocumentAction();
+      showToast(boundLayerId ? "Mask linked to live layer luminance." : "Mask layer link removed.");
+      return;
+    }
     const materialKey = event.target.dataset.materialParam || event.target.dataset.materialNumber;
     const materialSelect = event.target.dataset.materialSelect;
     const materialColor = event.target.dataset.materialColor;
@@ -8998,17 +9362,6 @@ function wireEvents() {
       return;
     }
     const maskSetting = event.target.dataset.maskSetting;
-    const maskBindLayer = event.target.dataset.maskBindLayer;
-    if (maskBindLayer !== undefined) {
-      const layer = getSelectedLayer();
-      const target = state.layers.find((item) => item.id === event.target.value);
-      if (!layer?.mask) return;
-      layer.mask.bindLayerId = target?.mask && target.id !== layer.id ? target.id : null;
-      renderFilters();
-      requestRender();
-      commitDocumentAction();
-      return;
-    }
     if (maskSetting) {
       const layer = getSelectedLayer();
       const value = Number(event.target.value);
@@ -9026,6 +9379,58 @@ function wireEvents() {
     const card = event.target.closest(".filter-card");
     const layer = getSelectedLayer();
     const filter = layer?.filters.find((item) => item.id === card?.dataset.filterId);
+    const parameterOffsetLayer = "parameterOffsetLayer" in event.target.dataset;
+    const parameterOffsetFilter = "parameterOffsetFilter" in event.target.dataset;
+    const parameterOffsetRelative = "parameterOffsetRelative" in event.target.dataset;
+    const parameterOffsetKey = event.target.dataset.parameterOffsetParam
+      || event.target.dataset.parameterOffsetNumber;
+    if (filter?.defId === "parameterOffset" && (
+      parameterOffsetLayer || parameterOffsetFilter || parameterOffsetRelative || parameterOffsetKey
+    )) {
+      if (parameterOffsetLayer) {
+        filter.params.sourceLayerId = event.target.value || null;
+        filter.params.sourceFilterId = null;
+        filter.params.overrides = {};
+      } else if (parameterOffsetFilter) {
+        filter.params.sourceFilterId = event.target.value || null;
+        filter.params.overrides = {};
+      } else if (parameterOffsetRelative) {
+        const sourceFilter = getParameterOffsetSourceFilter(layer, filter);
+        const sourceDef = sourceFilter && FILTER_DEFS.find((item) => item.id === sourceFilter.defId);
+        if (!sourceFilter || !sourceDef) return;
+        const nextRelative = event.target.checked;
+        if (nextRelative !== filter.params.relative) {
+          for (const [key, override] of Object.entries(filter.params.overrides || {})) {
+            const param = sourceDef.params.find((item) => item.key === key);
+            const sourceValue = sourceFilter.params[key];
+            if (!param || typeof sourceValue !== "number" || typeof override !== "number") continue;
+            filter.params.overrides[key] = nextRelative
+              ? override - sourceValue
+              : clampFilterParam(sourceValue + override, param);
+          }
+        }
+        filter.params.relative = nextRelative;
+      } else {
+        const value = Number(event.target.value);
+        if (!Number.isFinite(value)) return;
+        filter.params.overrides ||= {};
+        filter.params.overrides[parameterOffsetKey] = value;
+        const peer = card.querySelector(event.target.dataset.parameterOffsetParam
+          ? `[data-parameter-offset-number="${parameterOffsetKey}"]`
+          : `[data-parameter-offset-param="${parameterOffsetKey}"]`);
+        if (peer) peer.value = String(value);
+      }
+      invalidateLayerThumbnail(layer);
+      requestRender();
+      if (parameterOffsetLayer || parameterOffsetFilter || parameterOffsetRelative) {
+        renderFilters();
+        renderLayers();
+        commitDocumentAction();
+      } else {
+        scheduleSave();
+      }
+      return;
+    }
     const key = event.target.dataset.filterParam
       || event.target.dataset.filterNumber
       || event.target.dataset.filterValue

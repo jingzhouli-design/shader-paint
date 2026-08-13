@@ -1663,6 +1663,22 @@ input[type="number"]::-webkit-inner-spin-button {
   box-shadow: 0 0 0 2px #171a1f, 0 0 0 3px rgba(240, 163, 95, 0.58);
 }
 
+.mask-thumb.bound {
+  border-color: #b69cff;
+  box-shadow: 0 0 0 2px #171a1f, 0 0 0 3px rgba(182, 156, 255, 0.58);
+}
+
+.bound-layer-icon {
+  width: 12px;
+  height: 12px;
+  margin-left: 5px;
+  fill: none;
+  stroke: #b69cff;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  vertical-align: -2px;
+}
+
 .mask-thumb.disabled {
   border-color: rgba(217, 138, 105, 0.65);
   opacity: 0.48;
@@ -2409,6 +2425,46 @@ input[type="number"]::-webkit-inner-spin-button {
 .filter-card .control-row {
   grid-template-columns: 48px minmax(0, 1fr) 42px;
   gap: 5px;
+}
+
+.filter-card .parameter-offset-control {
+  grid-template-columns: 48px minmax(0, 1fr) 42px 22px;
+}
+
+.parameter-offset-source-title {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin: 7px 0 3px;
+  color: #aeb5af;
+  font-size: 8px;
+}
+
+.parameter-offset-source-title small,
+.parameter-offset-note {
+  color: #747b80;
+  font-size: 7px;
+}
+
+.parameter-offset-note {
+  margin: 6px 0 2px;
+  line-height: 1.45;
+}
+
+.parameter-offset-reset {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  color: #aeb5af;
+  background: rgba(255, 255, 255, 0.055);
+  cursor: pointer;
+}
+
+.parameter-offset-reset:disabled {
+  opacity: 0.25;
+  cursor: default;
 }
 
 .material-panel-content {
@@ -3461,6 +3517,44 @@ input[type="number"]::-webkit-inner-spin-button {
   color: #7d8580;
   font-size: 9px;
   line-height: 1.45;
+}
+
+.mask-bind-setting {
+  display: grid;
+  gap: 7px;
+  padding: 8px;
+  border: 1px solid rgba(182, 156, 255, 0.18);
+  border-radius: 8px;
+  background: rgba(182, 156, 255, 0.055);
+}
+
+.mask-bind-setting > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.mask-bind-setting b {
+  color: #d7d0ea;
+  font-size: 10px;
+}
+
+.mask-bind-setting small {
+  color: #777e82;
+  font-size: 7px;
+}
+
+.mask-bind-setting select {
+  width: 100%;
+  height: 26px;
+  padding: 0 24px 0 8px;
+  border: 1px solid rgba(255, 255, 255, 0.075);
+  border-radius: 7px;
+  color: #b7bcb7;
+  background: #20242a;
+  font: inherit;
+  font-size: 8px;
 }
 
 .mask-settings-divider {
