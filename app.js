@@ -5,6 +5,10 @@ let DOC_WIDTH = 1200;
 let DOC_HEIGHT = 900;
 const STORAGE_KEY = "shaderpaint:document:v1";
 const STORAGE_METADATA_KEY = "shaderpaint:document:autosave-status:v1";
+const RECOVERY_DATABASE_NAME = "shaderpaint-recovery";
+const RECOVERY_DATABASE_VERSION = 1;
+const RECOVERY_STORE_NAME = "documents";
+const RECOVERY_DOCUMENT_KEY = "latest";
 const MAX_HISTORY_SNAPSHOTS = 40;
 const MAX_HISTORY_BYTES = 128 * 1024 * 1024;
 const MIN_HISTORY_SNAPSHOTS = 3;
@@ -2444,7 +2448,7 @@ function renderDocument(forcedSize = null) {
     bindTexture(gpu.compositeProgram, "uLayer", layerTexture, 1);
     const visibleMask = state.transformStroke?.layerId === layer.id
       ? state.transformStroke.previewMask
-      : layer.mask;
+      : getBoundMask(layer);
     bindTexture(gpu.compositeProgram, "uMask", visibleMask?.texture || gpu.whiteMask, 2);
     bindTexture(gpu.compositeProgram, "uClip", previousLayerTexture, 3);
     gl.uniform1f(gl.getUniformLocation(gpu.compositeProgram, "uOpacity"), layer.opacity);
@@ -2577,6 +2581,7 @@ function createMask(fillValue = 255) {
     roughenWidth: 8,
     roughenScale: 24,
     roughenSharpness: 1,
+    bindLayerId: null,
   };
   createMaskGpuTextures(mask, data);
   return mask;
@@ -2975,9 +2980,17 @@ function createLayerFromSourceCanvas(sourceCanvas, name, options = {}) {
     layer.mask.roughenWidth = options.maskRoughenWidth ?? 8;
     layer.mask.roughenScale = options.maskRoughenScale ?? 24;
     layer.mask.roughenSharpness = options.maskRoughenSharpness ?? 1;
+    layer.mask.bindLayerId = options.maskBindLayerId ?? null;
     uploadFullMask(layer.mask);
   }
+
   return layer;
+}
+
+function getBoundMask(layer) {
+  if (!layer.mask?.bindLayerId) return layer.mask;
+  const boundLayer = state.layers.find((candidate) => candidate.id === layer.mask?.bindLayerId);
+  return boundLayer?.mask || layer.mask;
 }
 
 async function createLayerFromImage(url, name, options = {}) {
@@ -4988,6 +5001,7 @@ async function duplicateLayer(layer) {
     maskRoughenWidth: layer.mask?.roughenWidth,
     maskRoughenScale: layer.mask?.roughenScale,
     maskRoughenSharpness: layer.mask?.roughenSharpness,
+    maskBindLayerId: layer.mask?.bindLayerId,
     filters: layer.filters.map((filter) => ({
       ...filter,
       id: uid("filter"),
@@ -5780,9 +5794,21 @@ function renderFilters() {
     ? "Post filters run after material lighting, from bottom to top. Drag to reorder."
     : "Filters run from bottom to top. Drag to reorder.";
   if (showMaskSettings) {
+    const boundLayerId = mask.bindLayerId || "";
+    const bindChoices = state.layers
+      .filter((candidate) => candidate.id !== layer.id && candidate.mask)
+      .map((candidate) => `<option value="${candidate.id}" ${candidate.id === boundLayerId ? "selected" : ""}>${escapeHtml(candidate.name)}</option>`)
+      .join("");
     filterList.innerHTML = `
       <section class="mask-settings-card">
         <p>Controls the selected layer mask without changing its painted pixels.</p>
+        <div class="control-row">
+          <label>Bind layer</label>
+          <select data-mask-bind-layer>
+            <option value="" ${boundLayerId ? "" : "selected"}>This layer</option>
+            ${bindChoices}
+          </select>
+        </div>
         ${renderMaskSetting("Softness", "softness", mask.softness, 0, 1, 0.01)}
         ${renderMaskSetting("Opacity", "opacity", mask.opacity, 0, 1, 0.01)}
         ${renderMaskSetting("Contrast", "contrast", mask.contrast, -1, 1, 0.01)}
@@ -6878,6 +6904,7 @@ function captureHistorySnapshot() {
         roughenWidth: layer.mask.roughenWidth,
         roughenScale: layer.mask.roughenScale,
         roughenSharpness: layer.mask.roughenSharpness,
+        bindLayerId: layer.mask.bindLayerId,
       } : null,
       filters: layer.filters.map((filter) => ({
         id: filter.id,
@@ -7006,6 +7033,7 @@ async function restoreHistorySnapshot(snapshot) {
         maskRoughenWidth: item.mask?.roughenWidth,
         maskRoughenScale: item.mask?.roughenScale,
         maskRoughenSharpness: item.mask?.roughenSharpness,
+        maskBindLayerId: item.mask?.bindLayerId,
         filters: item.filters.map((filter) => ({
           ...filter,
           params: cloneHistoryValue(filter.params),
@@ -7229,6 +7257,7 @@ function serializeDocument({ includeBinary = true } = {}) {
         roughenWidth: layer.mask.roughenWidth,
         roughenScale: layer.mask.roughenScale,
         roughenSharpness: layer.mask.roughenSharpness,
+        bindLayerId: layer.mask.bindLayerId,
         image: includeBinary ? encodeMask(layer.mask) : null,
       } : null,
       filters: layer.filters.map((filter) => ({
@@ -7293,8 +7322,7 @@ function flushDocumentAutosave() {
   state.viewportSaveTimer = 0;
   flushDirtyPaintLayerDataUrls();
   if (isDesktopAutosaveAvailable()) return requestDesktopAutosave();
-  saveDocument();
-  return Promise.resolve();
+  return saveDocument();
 }
 
 function storeAutosaveMetadata() {
@@ -7336,7 +7364,65 @@ function resumeLocalAutosave() {
   }
 }
 
-function saveDocument() {
+function openRecoveryDatabase() {
+  return new Promise((resolve, reject) => {
+    if (!("indexedDB" in window)) {
+      reject(new Error("IndexedDB is unavailable."));
+      return;
+    }
+    const request = indexedDB.open(RECOVERY_DATABASE_NAME, RECOVERY_DATABASE_VERSION);
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains(RECOVERY_STORE_NAME)) {
+        request.result.createObjectStore(RECOVERY_STORE_NAME);
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error("Could not open IndexedDB."));
+  });
+}
+
+async function saveBrowserRecovery(serialized) {
+  const database = await openRecoveryDatabase();
+  try {
+    await new Promise((resolve, reject) => {
+      const transaction = database.transaction(RECOVERY_STORE_NAME, "readwrite");
+      transaction.objectStore(RECOVERY_STORE_NAME).put(serialized, RECOVERY_DOCUMENT_KEY);
+      transaction.oncomplete = resolve;
+      transaction.onerror = () => reject(transaction.error || new Error("Could not save browser recovery data."));
+      transaction.onabort = () => reject(transaction.error || new Error("Browser recovery save was aborted."));
+    });
+  } finally {
+    database.close();
+  }
+}
+
+async function loadBrowserRecovery() {
+  const database = await openRecoveryDatabase();
+  try {
+    return await new Promise((resolve, reject) => {
+      const transaction = database.transaction(RECOVERY_STORE_NAME, "readonly");
+      const request = transaction.objectStore(RECOVERY_STORE_NAME).get(RECOVERY_DOCUMENT_KEY);
+      request.onsuccess = () => resolve(typeof request.result === "string" ? request.result : null);
+      request.onerror = () => reject(request.error || new Error("Could not read browser recovery data."));
+    });
+  } finally {
+    database.close();
+  }
+}
+
+function saveLocalStorageRecovery(serialized, estimatedCharacters) {
+  if (state.localAutosaveDisabled && estimatedCharacters > state.localAutosaveRetryLimit) return false;
+  if (serialized.length > MAX_LOCAL_AUTOSAVE_CHARACTERS) return false;
+  try {
+    localStorage.setItem(STORAGE_KEY, serialized);
+    return true;
+  } catch (error) {
+    console.warn("Shader Paint could not update the localStorage recovery fallback.", error);
+    return false;
+  }
+}
+
+async function saveDocument() {
   state.saveTimer = 0;
   state.viewportSaveTimer = 0;
   if (state.paintPointerId !== null || hasDirtyPaintLayerDataUrls()) {
@@ -7344,21 +7430,11 @@ function saveDocument() {
     return;
   }
   if (isDesktopAutosaveAvailable()) {
-    void requestDesktopAutosave();
+    await requestDesktopAutosave();
     return;
   }
 
   const estimatedCharacters = estimateLocalAutosaveCharacters();
-  if (state.localAutosaveDisabled && estimatedCharacters > state.localAutosaveRetryLimit) return;
-
-  if (estimatedCharacters > MAX_LOCAL_AUTOSAVE_CHARACTERS) {
-    pauseLocalAutosave(
-      Math.floor(MAX_LOCAL_AUTOSAVE_CHARACTERS / 2),
-      "Browser autosave paused for this large document. It remains open; use Save to keep a .shaderpaint copy before closing.",
-    );
-    return;
-  }
-
   let serialized;
   try {
     serialized = JSON.stringify(serializeDocument());
@@ -7371,22 +7447,21 @@ function saveDocument() {
     return;
   }
 
-  if (serialized.length > MAX_LOCAL_AUTOSAVE_CHARACTERS) {
-    pauseLocalAutosave(
-      Math.floor(MAX_LOCAL_AUTOSAVE_CHARACTERS / 2),
-      "Browser autosave paused for this large document. It remains open; use Save to keep a .shaderpaint copy before closing.",
-    );
-    return;
-  }
-
+  // localStorage is synchronous, so this protects short edits if the page closes
+  // before the IndexedDB write below can settle.
+  const localFallbackSaved = saveLocalStorageRecovery(serialized, estimatedCharacters);
   try {
-    localStorage.setItem(STORAGE_KEY, serialized);
+    await saveBrowserRecovery(serialized);
     resumeLocalAutosave();
   } catch (error) {
-    console.error("Shader Paint could not save the document.", error);
+    console.warn("Shader Paint could not save browser recovery data to IndexedDB; using localStorage fallback.", error);
+    if (localFallbackSaved) {
+      resumeLocalAutosave();
+      return;
+    }
     pauseLocalAutosave(
       Math.floor(serialized.length / 2),
-      "Browser autosave is full and has been paused. Your document remains open; use Save to keep a .shaderpaint copy before closing.",
+      "Browser autosave is unavailable. Your document remains open; use Save to keep a .shaderpaint copy before closing.",
     );
   }
 }
@@ -7498,6 +7573,7 @@ async function applyStoredDocument(stored) {
         maskRoughenWidth: item.mask?.roughenWidth,
         maskRoughenScale: item.mask?.roughenScale,
         maskRoughenSharpness: item.mask?.roughenSharpness,
+        maskBindLayerId: item.mask?.bindLayerId,
         filters: Array.isArray(item.filters)
           ? item.filters.map(normalizeStoredFilter).filter(Boolean)
           : [],
@@ -7546,10 +7622,15 @@ async function restoreDesktopAutosave() {
 }
 
 async function restoreBrowserDocument() {
-  let raw;
+  let raw = null;
   let metadata = null;
   try {
-    raw = localStorage.getItem(STORAGE_KEY);
+    raw = await loadBrowserRecovery();
+  } catch (error) {
+    console.warn("IndexedDB browser recovery could not be read; checking localStorage.", error);
+  }
+  try {
+    raw ||= localStorage.getItem(STORAGE_KEY);
     const metadataRaw = localStorage.getItem(STORAGE_METADATA_KEY);
     metadata = metadataRaw ? JSON.parse(metadataRaw) : null;
   } catch (error) {
@@ -7809,6 +7890,24 @@ function showToast(message) {
 function reportError(error) {
   console.error(error);
   showToast(error instanceof Error ? error.message : "Something went wrong.");
+}
+
+function registerOfflineSupport() {
+  if (!("serviceWorker" in navigator)) return;
+  navigator.serviceWorker.register("./service-worker.js", { scope: "./" })
+    .then(() => navigator.serviceWorker.ready)
+    .then((registration) => {
+      const urls = [
+        window.location.href,
+        ...[...document.querySelectorAll("script[src], link[href], img[src]")].map((element) => element.href || element.src),
+        ...performance.getEntriesByType("resource").map((entry) => entry.name),
+      ].filter((url, index, values) => {
+        const parsed = new URL(url, window.location.href);
+        return parsed.origin === window.location.origin && values.indexOf(url) === index;
+      });
+      registration.active?.postMessage({ type: "cache-assets", urls });
+    })
+    .catch((error) => console.warn("Offline support could not be registered.", error));
 }
 
 function wireEvents() {
@@ -8162,7 +8261,57 @@ function wireEvents() {
     requestRender();
   });
   blendSelectMenu.addEventListener("pointerleave", clearBlendModePreview);
+  let blendModeDrag = null;
+  let ignoreBlendModeClick = false;
+  blendSelectMenu.addEventListener("pointerdown", (event) => {
+    const button = event.target.closest("[data-blend-mode]");
+    if (!button) return;
+    blendModeDrag = { pointerId: event.pointerId, mode: button.dataset.blendMode, moved: false };
+    blendSelectMenu.setPointerCapture(event.pointerId);
+    state.blendPreviewMode = button.dataset.blendMode;
+    requestRender();
+    event.preventDefault();
+  });
+  blendSelectMenu.addEventListener("pointermove", (event) => {
+    if (!blendModeDrag || blendModeDrag.pointerId !== event.pointerId) return;
+    const button = document.elementFromPoint(event.clientX, event.clientY)?.closest("[data-blend-mode]");
+    if (!button) return;
+    blendModeDrag.moved ||= button.dataset.blendMode !== blendModeDrag.mode;
+    blendModeDrag.mode = button.dataset.blendMode;
+    if (state.blendPreviewMode !== blendModeDrag.mode) {
+      state.blendPreviewMode = blendModeDrag.mode;
+      requestRender();
+    }
+    event.preventDefault();
+  });
+  const finishBlendModeDrag = (event, cancelled = false) => {
+    if (!blendModeDrag || blendModeDrag.pointerId !== event.pointerId) return;
+    if (blendSelectMenu.hasPointerCapture(event.pointerId)) blendSelectMenu.releasePointerCapture(event.pointerId);
+    const mode = blendModeDrag.mode;
+    blendModeDrag = null;
+    if (cancelled) {
+      clearBlendModePreview();
+      return;
+    }
+    const layer = getSelectedLayer();
+    if (!layer) return;
+    ignoreBlendModeClick = true;
+    window.setTimeout(() => {
+      ignoreBlendModeClick = false;
+    }, 0);
+    layer.blendMode = mode;
+    blendMode.value = mode;
+    state.blendPreviewMode = null;
+    blendSelectMenu.hidden = true;
+    blendSelectTrigger.setAttribute("aria-expanded", "false");
+    syncLayerControls();
+    requestRender();
+    commitDocumentAction();
+  };
+  blendSelectMenu.addEventListener("pointerup", finishBlendModeDrag);
+  blendSelectMenu.addEventListener("pointercancel", (event) => finishBlendModeDrag(event, true));
   blendSelectMenu.addEventListener("click", (event) => {
+    if (blendModeDrag || ignoreBlendModeClick) return;
     const button = event.target.closest("[data-blend-mode]");
     const layer = getSelectedLayer();
     if (!button || !layer) return;
@@ -8567,6 +8716,31 @@ function wireEvents() {
   });
   filterMenu.addEventListener("pointerup", (event) => finishFilterMenuDrag(event));
   filterMenu.addEventListener("pointercancel", (event) => finishFilterMenuDrag(event, true));
+  const filtersPanel = document.getElementById("filtersPanel");
+  let filterCategorySwipe = null;
+  filtersPanel.addEventListener("pointerdown", (event) => {
+    if (filterMenu.hidden || event.target.closest("button, input, select, textarea, .filter-card, [data-filter-menu-item]")) return;
+    filterCategorySwipe = { pointerId: event.pointerId, x: event.clientX, y: event.clientY };
+    filtersPanel.setPointerCapture(event.pointerId);
+  });
+  filtersPanel.addEventListener("pointermove", (event) => {
+    if (!filterCategorySwipe || filterCategorySwipe.pointerId !== event.pointerId) return;
+    const deltaX = event.clientX - filterCategorySwipe.x;
+    const deltaY = event.clientY - filterCategorySwipe.y;
+    if (Math.abs(deltaX) < 48 || Math.abs(deltaX) < Math.abs(deltaY)) return;
+    const categories = ["All filters", ...getOrderedFilterGroups()];
+    const currentIndex = categories.indexOf(state.filterMenuCategory);
+    const direction = deltaX < 0 ? 1 : -1;
+    state.filterMenuCategory = categories[(currentIndex + direction + categories.length) % categories.length];
+    filterCategorySwipe = null;
+    renderFilterMenu();
+    event.preventDefault();
+  });
+  ["pointerup", "pointercancel"].forEach((eventName) => filtersPanel.addEventListener(eventName, (event) => {
+    if (filterCategorySwipe?.pointerId !== event.pointerId) return;
+    if (filtersPanel.hasPointerCapture(event.pointerId)) filtersPanel.releasePointerCapture(event.pointerId);
+    filterCategorySwipe = null;
+  }));
   document.addEventListener("pointerdown", (event) => {
     if (!event.target.closest(".filter-add-wrap")) filterMenu.hidden = true;
     if (!event.target.closest(".blend-select")) {
@@ -8824,6 +8998,17 @@ function wireEvents() {
       return;
     }
     const maskSetting = event.target.dataset.maskSetting;
+    const maskBindLayer = event.target.dataset.maskBindLayer;
+    if (maskBindLayer !== undefined) {
+      const layer = getSelectedLayer();
+      const target = state.layers.find((item) => item.id === event.target.value);
+      if (!layer?.mask) return;
+      layer.mask.bindLayerId = target?.mask && target.id !== layer.id ? target.id : null;
+      renderFilters();
+      requestRender();
+      commitDocumentAction();
+      return;
+    }
     if (maskSetting) {
       const layer = getSelectedLayer();
       const value = Number(event.target.value);
@@ -9291,6 +9476,7 @@ async function start() {
   requestRender();
   resetDocumentHistory();
   await initializeBrushTextureLibrary();
+  registerOfflineSupport();
   if (isDesktopAutosaveAvailable()) scheduleSave();
   requestAnimationFrame(animationLoop);
 }

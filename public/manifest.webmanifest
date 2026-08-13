@@ -1,0 +1,9 @@
+{
+  "name": "Shader Paint",
+  "short_name": "Shader Paint",
+  "description": "Offline-capable shader painting workspace.",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#0c0e12",
+  "theme_color": "#111318"
+}

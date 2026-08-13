@@ -497,6 +497,36 @@ const HSL_GLSL = `
 // fragment shader "key" (cached/compiled once) plus an updateUniforms callback.
 export const FILTER_DEFS = [
   {
+    id: "parameterOffset",
+    label: "Parameter Offset",
+    group: "Distort",
+    icon: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"><path d="M3 8h10M10.5 5.5 13 8l-2.5 2.5"/><path d="M3 3.5v9"/></svg>`,
+    params: [
+      { key: "offsetX", label: "Offset X", min: -1, max: 1, step: 0.001, default: 0 },
+      { key: "offsetY", label: "Offset Y", min: -1, max: 1, step: 0.001, default: 0 },
+      { key: "wrap", label: "Wrap", type: "toggle", default: false },
+    ],
+    passes: [{
+      key: "parameter-offset",
+      fragmentShader: `
+        uniform sampler2D tDiffuse;
+        uniform vec2 uOffset;
+        uniform float uWrap;
+        varying vec2 vUv;
+        void main() {
+          vec2 uv = vUv - uOffset;
+          if (uWrap > 0.5) uv = fract(uv);
+          else uv = clamp(uv, 0.0, 1.0);
+          gl_FragColor = texture2D(tDiffuse, uv);
+        }
+      `,
+      updateUniforms(u, params) {
+        u.uOffset.value.set(Number(params.offsetX) || 0, Number(params.offsetY) || 0);
+        u.uWrap.value = params.wrap === true ? 1 : 0;
+      },
+    }],
+  },
+  {
     id: "glow",
     label: "Glow / Deep Glow",
     group: "Color",

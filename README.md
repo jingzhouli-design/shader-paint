@@ -38,6 +38,14 @@ workflow builds and deploys the app whenever changes are pushed to `main`.
    deployment details.
 
 The application is static: browser file inputs handle imports, browser
-downloads handle exports, and small documents can use browser local storage.
+downloads handle exports, and project recovery uses browser IndexedDB.
 Electron-only native dialogs, local texture folders, and desktop autosave are
 intentionally unavailable in this Web App test.
+
+## Offline use on iPad
+
+Open the deployed site once while online, then use Safari's **Add to Home Screen**
+command. The installed app caches its code, bundled assets, and brush library
+for offline startup. Automatic project recovery uses IndexedDB, which supports
+larger documents than localStorage. Keep exported `.shaderpaint` files for
+important work because iPadOS may clear website storage when device space is low.
