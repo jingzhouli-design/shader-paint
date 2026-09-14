@@ -254,6 +254,12 @@ function releaseMaterialMapTextures(layer) {
   ["colorMap", "normalMap", "roughnessMap", "metalnessMap"].forEach((key) => {
     const textureKey = `_${key}Texture`;
     const urlKey = `_${key}TextureUrl`;
+    const imageKey = `_${key}Image`;
+    if (layer[imageKey]) {
+      layer[imageKey].onload = null;
+      layer[imageKey].onerror = null;
+      layer[imageKey] = null;
+    }
     if (layer[textureKey]) gl.deleteTexture(layer[textureKey]);
     layer[textureKey] = null;
     layer[urlKey] = null;
@@ -270,11 +276,9 @@ function releaseHiddenLayerTextures(layer) {
   layer.paintFramebuffer = null;
   layer.paintScratchFramebuffer = null;
   destroyLayerFilterCache(layer);
-  if (layer.mask?.texture) gl.deleteTexture(layer.mask.texture);
-  if (layer.mask) layer.mask.texture = null;
-  if (layer.mask?.scratchTexture) gl.deleteTexture(layer.mask.scratchTexture);
-  if (layer.mask) layer.mask.scratchTexture = null;
-  if (layer.kind === "material") releaseMaterialMapTextures(layer);
+  destroyMaskGpu(layer.mask);
+  layer.filters.forEach(releaseFilterGpu);
+  releaseMaterialMapTextures(layer);
 }
 
 function ensureLayerGpuTextures(layer) {
@@ -1701,7 +1705,7 @@ function createTarget(width, height) {
   if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
     throw new Error("Unable to create a complete WebGL framebuffer.");
   }
-  return { texture, framebuffer };
+  return { texture, framebuffer, width, height };
 }
 
 function initializeGpu() {
@@ -1934,28 +1938,51 @@ function uploadPassUniforms(compiled, sourceTexture) {
   });
 }
 
+function releaseFilterImageTexture(filter) {
+  if (!filter) return;
+  if (filter._imageLoading) {
+    filter._imageLoading.onload = null;
+    filter._imageLoading.onerror = null;
+    filter._imageLoading = null;
+  }
+  if (filter._imageTexture) gl.deleteTexture(filter._imageTexture);
+  filter._imageTexture = null;
+  filter._imageTextureUrl = null;
+  filter._imageTextureRevision = (filter._imageTextureRevision || 0) + 1;
+}
+
+function releaseFilterGpu(filter) {
+  releaseFilterImageTexture(filter);
+  if (filter._resolvedFilter) {
+    releaseFilterImageTexture(filter._resolvedFilter);
+    filter._resolvedFilter = null;
+  }
+}
+
 function getFilterImageTexture(filter) {
   const url = filter?.params?.image;
   if (!url) {
-    if (filter?._imageTexture) gl.deleteTexture(filter._imageTexture);
-    if (filter) {
-      filter._imageTexture = null;
-      filter._imageTextureUrl = null;
-    }
+    if (filter?._imageTextureUrl) releaseFilterImageTexture(filter);
     return null;
   }
   if (filter._imageTextureUrl === url) return filter._imageTexture || null;
-  if (filter._imageTexture) gl.deleteTexture(filter._imageTexture);
-  filter._imageTexture = null;
+  releaseFilterImageTexture(filter);
   filter._imageTextureUrl = url;
   const image = new Image();
+  filter._imageLoading = image;
   image.onload = () => {
-    if (filter._imageTextureUrl !== url) return;
+    if (filter._imageLoading !== image) return;
+    filter._imageLoading = null;
     filter._imageTexture = textureFromCanvas(image);
+    filter._imageTextureRevision += 1;
+    state.layers.forEach((layer) => {
+      if (layer.filters.some((item) => item === filter || item._resolvedFilter === filter)) invalidateLayerThumbnail(layer);
+    });
     requestRender();
   };
   image.onerror = () => {
-    if (filter._imageTextureUrl === url) {
+    if (filter._imageLoading === image) {
+      filter._imageLoading = null;
       filter._imageTextureUrl = null;
       showToast("Displacement map could not be loaded.");
     }
@@ -2045,24 +2072,33 @@ function getMaterialMapTexture(layer, key) {
   const url = layer.material?.[key];
   const textureKey = `_${key}Texture`;
   const urlKey = `_${key}TextureUrl`;
+  const imageKey = `_${key}Image`;
+  if (layer[urlKey] === url) return layer[textureKey] || null;
+  if (layer[imageKey]) {
+    layer[imageKey].onload = null;
+    layer[imageKey].onerror = null;
+    layer[imageKey] = null;
+  }
   if (!url) {
     if (layer[textureKey]) gl.deleteTexture(layer[textureKey]);
     layer[textureKey] = null;
     layer[urlKey] = null;
     return null;
   }
-  if (layer[urlKey] === url) return layer[textureKey] || null;
   if (layer[textureKey]) gl.deleteTexture(layer[textureKey]);
   layer[textureKey] = null;
   layer[urlKey] = url;
   const image = new Image();
+  layer[imageKey] = image;
   image.onload = () => {
-    if (layer[urlKey] !== url) return;
+    if (layer[imageKey] !== image) return;
+    layer[imageKey] = null;
     layer[textureKey] = textureFromCanvas(image);
     requestRender();
   };
   image.onerror = () => {
-    if (layer[urlKey] === url) {
+    if (layer[imageKey] === image) {
+      layer[imageKey] = null;
       layer[urlKey] = null;
       showToast("Material map could not be loaded.");
     }
@@ -2345,7 +2381,10 @@ function clampFilterParam(value, param) {
 function resolveParameterOffsetFilter(layer, filter) {
   const sourceLayer = getParameterOffsetSourceLayer(layer, filter);
   const sourceFilter = getParameterOffsetSourceFilter(layer, filter);
-  if (!sourceFilter?.enabled || sourceLayer?.filtersEnabled === false) return null;
+  if (!sourceFilter?.enabled || sourceLayer?.filtersEnabled === false) {
+    releaseFilterGpu(filter);
+    return null;
+  }
   const def = FILTER_DEFS.find((item) => item.id === sourceFilter.defId);
   if (!def) return null;
   const params = cloneHistoryValue(sourceFilter.params);
@@ -2358,12 +2397,13 @@ function resolveParameterOffsetFilter(layer, filter) {
       ? clampFilterParam(sourceValue + override, param)
       : typeof override === "number" ? clampFilterParam(override, param) : cloneHistoryValue(override);
   }
-  return {
-    ...sourceFilter,
-    id: filter.id,
-    defId: def.id,
-    params,
-  };
+  // Keep texture ownership on the offset instance, not on a per-frame copy.
+  if (filter._resolvedFilter?.defId !== def.id) {
+    releaseFilterGpu(filter);
+    filter._resolvedFilter = { id: filter.id, defId: def.id, enabled: true };
+  }
+  filter._resolvedFilter.params = params;
+  return filter._resolvedFilter;
 }
 
 function renderLayerFilters(layer, timeSeconds, sourceOverride = null, options = {}) {
@@ -2379,10 +2419,18 @@ function renderLayerFilters(layer, timeSeconds, sourceOverride = null, options =
       .filter(Boolean)
       .reverse()
     : [];
-  if (!activeFilters.length) return source;
-  const animated = state.paintPointerId === null && activeFilters.some((filter) => filterUsesMotion(filter));
-  const cacheable = !sourceOverride && !animated && !options.penetrationSource;
-  const stableCacheKey = !sourceOverride ? filterCacheKey(layer, activeFilters) : null;
+  if (!activeFilters.length) {
+    destroyLayerFilterCache(layer);
+    return source;
+  }
+  const usesMotion = activeFilters.some((filter) => filterUsesMotion(filter));
+  const cacheable = !sourceOverride && !options.penetrationSource;
+  const filterTime = cacheable && usesMotion && state.paintPointerId !== null
+    ? layer.filterCache?.time ?? timeSeconds
+    : timeSeconds;
+  const stableCacheKey = !sourceOverride
+    ? `${filterCacheKey(layer, activeFilters)}:${usesMotion ? filterTime : "static"}`
+    : null;
   if (
     cacheable
     && layer.filterCache?.width === gpu.renderWidth
@@ -2408,7 +2456,7 @@ function renderLayerFilters(layer, timeSeconds, sourceOverride = null, options =
         compiled.uniforms.uMatchRatio.value = def.group === "Generate" && layer.matchFilterRatio ? 1 : 0;
         compiled.uniforms.uAspectRatio.value = DOC_WIDTH / Math.max(1, DOC_HEIGHT);
       }
-      pass.updateUniforms(compiled.uniforms, filter.params, timeSeconds, {
+      pass.updateUniforms(compiled.uniforms, filter.params, filterTime, {
         instance: filter,
         compositor: nativeFilterCompositor,
         stack: activeFilters,
@@ -2445,6 +2493,7 @@ function renderLayerFilters(layer, timeSeconds, sourceOverride = null, options =
     bindTexture(gpu.displayProgram, "uSource", source, 0);
     drawFullscreen();
     layer.filterCacheKey = stableCacheKey;
+    layer.filterCache.time = filterTime;
     return layer.filterCache.target.texture;
   }
   return source;
@@ -2458,8 +2507,6 @@ function ensureBoundMaskTarget(mask) {
   }
   destroyBoundMaskTarget(mask);
   mask.boundTarget = createTarget(gpu.renderWidth, gpu.renderHeight);
-  mask.boundTarget.width = gpu.renderWidth;
-  mask.boundTarget.height = gpu.renderHeight;
   return mask.boundTarget;
 }
 
@@ -2534,6 +2581,7 @@ function filterCacheKey(layer, filters) {
   const compactParams = filters.map((filter) => [
     filter.id,
     filter.defId,
+    filter._imageTextureRevision || 0,
     Object.entries(filter.params).map(([key, value]) => [
       key,
       typeof value === "string" && value.startsWith("data:")
@@ -2744,12 +2792,31 @@ function createMaskFramebuffer(texture) {
 }
 
 function createMaskGpuTextures(mask, data) {
+  destroyMaskGpu(mask);
+  mask.texture = createTexture(DOC_WIDTH, DOC_HEIGHT, data, gl.R8, gl.RED);
+  mask.framebuffer = createMaskFramebuffer(mask.texture);
+}
+
+function ensureMaskScratchTarget(mask) {
+  if (!mask.texture) createMaskGpuTextures(mask, mask.data);
+  if (mask.scratchTexture) return;
+  // Both brush paths copy their dirty rectangle before using this scratch target.
+  mask.scratchTexture = createTexture(DOC_WIDTH, DOC_HEIGHT, null, gl.R8, gl.RED);
+  mask.scratchFramebuffer = createMaskFramebuffer(mask.scratchTexture);
+}
+
+function destroyMaskGpu(mask) {
+  if (!mask) return;
+  state.pendingMaskUploads.delete(mask);
+  if (mask.texture) gl.deleteTexture(mask.texture);
+  if (mask.scratchTexture) gl.deleteTexture(mask.scratchTexture);
   if (mask.framebuffer) gl.deleteFramebuffer(mask.framebuffer);
   if (mask.scratchFramebuffer) gl.deleteFramebuffer(mask.scratchFramebuffer);
-  mask.texture = createTexture(DOC_WIDTH, DOC_HEIGHT, data, gl.R8, gl.RED);
-  mask.scratchTexture = createTexture(DOC_WIDTH, DOC_HEIGHT, data, gl.R8, gl.RED);
-  mask.framebuffer = createMaskFramebuffer(mask.texture);
-  mask.scratchFramebuffer = createMaskFramebuffer(mask.scratchTexture);
+  mask.texture = null;
+  mask.scratchTexture = null;
+  mask.framebuffer = null;
+  mask.scratchFramebuffer = null;
+  destroyBoundMaskTarget(mask);
 }
 
 function createMask(fillValue = 255) {
@@ -3195,19 +3262,7 @@ async function createLayerFromImage(url, name, options = {}) {
 
 function destroyLayerGpu(layer) {
   window.clearTimeout(layer.sourceSerializationTimer);
-  destroyLayerFilterCache(layer);
-  if (layer.sourceTexture) gl.deleteTexture(layer.sourceTexture);
-  if (layer.paintScratchTexture) gl.deleteTexture(layer.paintScratchTexture);
-  if (layer.paintFramebuffer) gl.deleteFramebuffer(layer.paintFramebuffer);
-  if (layer.paintScratchFramebuffer) gl.deleteFramebuffer(layer.paintScratchFramebuffer);
-  if (layer.mask?.texture) gl.deleteTexture(layer.mask.texture);
-  if (layer.mask?.scratchTexture) gl.deleteTexture(layer.mask.scratchTexture);
-  if (layer.mask?.framebuffer) gl.deleteFramebuffer(layer.mask.framebuffer);
-  if (layer.mask?.scratchFramebuffer) gl.deleteFramebuffer(layer.mask.scratchFramebuffer);
-  destroyBoundMaskTarget(layer.mask);
-  ["_colorMapTexture", "_normalMapTexture", "_roughnessMapTexture", "_metalnessMapTexture"].forEach((key) => {
-    if (layer[key]) gl.deleteTexture(layer[key]);
-  });
+  releaseHiddenLayerTextures(layer);
 }
 
 function textureThumbnail(texture) {
@@ -3245,13 +3300,22 @@ function invalidateLayerThumbnail(layer) {
 
 function uploadFullMask(mask) {
   state.pendingMaskUploads.delete(mask);
+  if (!mask.texture) {
+    createMaskGpuTextures(mask, mask.data);
+    return;
+  }
   [mask.texture, mask.scratchTexture].forEach((texture) => {
+    if (!texture) return;
     gl.bindTexture(gl.TEXTURE_2D, texture);
     gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, DOC_WIDTH, DOC_HEIGHT, gl.RED, gl.UNSIGNED_BYTE, mask.data);
   });
 }
 
 function uploadMaskRegion(mask, dirty) {
+  if (!mask.texture) {
+    createMaskGpuTextures(mask, mask.data);
+    return;
+  }
   const x0 = Math.max(0, Math.floor(dirty.x0));
   const y0 = Math.max(0, Math.floor(dirty.y0));
   const x1 = Math.min(DOC_WIDTH, Math.ceil(dirty.x1));
@@ -3295,7 +3359,9 @@ function flushPendingMaskUploads() {
 }
 
 function fillMaskGpu(mask, value) {
+  if (!mask.texture) createMaskGpuTextures(mask, mask.data);
   [mask.framebuffer, mask.scratchFramebuffer].forEach((framebuffer) => {
+    if (!framebuffer) return;
     gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
     gl.viewport(0, 0, DOC_WIDTH, DOC_HEIGHT);
     gl.clearColor(value / 255, 0, 0, 1);
@@ -3312,6 +3378,7 @@ function clearMask(mask) {
 
 function stampMaskGpu(mask, dabs, target, dirty) {
   if (!dabs.length) return;
+  ensureMaskScratchTarget(mask);
   const preset = getBrushPreset();
   gl.bindFramebuffer(gl.READ_FRAMEBUFFER, mask.framebuffer);
   gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, mask.scratchFramebuffer);
@@ -4248,6 +4315,7 @@ function flushPendingMaskTransformPreview() {
 }
 
 function commitMaskTransformedBrush(mask, transform) {
+  ensureMaskScratchTarget(mask);
   const geometry = getPaintTransformGeometry(
     transform.center,
     transform.endpoint,
@@ -5239,9 +5307,8 @@ async function duplicateLayer(layer) {
     maskRoughenSharpness: layer.mask?.roughenSharpness,
     maskBoundLayerId: layer.mask?.boundLayerId,
     filters: layer.filters.map((filter) => ({
-      ...filter,
-      id: uid("filter"),
-      params: { ...filter.params },
+      ...cloneFilterForPaste(filter),
+      collapsed: filter.collapsed,
     })),
   });
   const index = state.layers.indexOf(layer);
@@ -5414,8 +5481,7 @@ function handleLayerMenuAction(layer, action) {
     pasted.contrast = source.contrast;
     pasted.boundLayerId = source.boundLayerId || null;
     uploadFullMask(pasted);
-    if (layer.mask) destroyBoundMaskTarget(layer.mask);
-    if (layer.mask) gl.deleteTexture(layer.mask.texture);
+    destroyMaskGpu(layer.mask);
     layer.mask = pasted;
     state.selectionPart = "mask";
     documentChanged = true;
@@ -5429,8 +5495,7 @@ function handleLayerMenuAction(layer, action) {
       ? "Brush edits cleared. The bound layer remains active."
       : "Mask cleared. The first brush stroke will choose its black or white base.");
   } else if (action === "mask-delete" && layer.mask) {
-    destroyBoundMaskTarget(layer.mask);
-    gl.deleteTexture(layer.mask.texture);
+    destroyMaskGpu(layer.mask);
     layer.mask = null;
     state.selectionPart = "content";
     documentChanged = true;
@@ -9230,7 +9295,10 @@ function wireEvents() {
     if (!action) return;
     if (action === "toggle") filter.enabled = !filter.enabled;
     else if (action === "collapse") filter.collapsed = !filter.collapsed;
-    else if (action === "delete") layer.filters = layer.filters.filter((item) => item.id !== filter.id);
+    else if (action === "delete") {
+      releaseFilterGpu(filter);
+      layer.filters = layer.filters.filter((item) => item.id !== filter.id);
+    }
     invalidateLayerThumbnail(layer);
     renderFilters();
     renderLayers();
