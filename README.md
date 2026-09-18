@@ -49,6 +49,8 @@ command. The installed app caches its code, bundled assets, and brush library
 for offline startup. Automatic project recovery uses IndexedDB, which supports
 larger documents than localStorage. Keep exported `.shaderpaint` files for
 important work because iPadOS may clear website storage when device space is low.
+Development servers skip and remove Shader Paint's offline cache so Vite's
+hot-reload module responses cannot be reused as production CSS or JavaScript.
 
 ## Rendering and memory
 
@@ -63,3 +65,23 @@ important work because iPadOS may clear website storage when device space is low
 - Duplicated filters and parameter-offset instances own independent GPU resources.
 - Preview limits, native-resolution PNG export, iPad input controls, IndexedDB
   recovery, offline support, and the 239 bundled brushes remain unchanged.
+
+## Manual image editing
+
+Base image and Paint layers support a Photoshop-style tool strip in the upper
+left of the canvas:
+
+- Brush (`B`) paints color directly only on Paint layers. On Base image layers,
+  it keeps the existing mask-painting workflow. A completed marquee clips
+  normal, stamp, and directional brush strokes.
+- Select/Transform (`V` or `Ctrl+T`) transforms the whole layer or the current
+  marquee. Drag corners with the aspect ratio locked, hold `Shift` for free
+  scaling, hold `Ctrl`/`Cmd` to pull one corner, and drag outside to rotate.
+  `Shift` snaps rotation to 5-degree increments. Leaving Transform clears its
+  selection outline.
+- Marquee (`M`) includes rectangular, freehand lasso, and point-by-point
+  polygonal selection.
+- Fill (`G`) fills the whole layer or current marquee with the active paint
+  color. Transform and fill operations use the existing undo/redo history.
+- Layer blend modes account for the backdrop's actual alpha, so lowering a
+  lower layer's opacity changes the overlap continuously.

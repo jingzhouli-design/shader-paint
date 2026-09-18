@@ -80,6 +80,9 @@ const brushValueNumber = document.getElementById("brushValueNumber");
 const brushModeButtons = document.getElementById("brushModeButtons");
 const brushPreview = document.getElementById("brushPreview");
 const brushCursor = document.getElementById("brushCursor");
+const manualTools = document.getElementById("manualTools");
+const manualToolOptions = document.getElementById("manualToolOptions");
+const selectionOverlay = document.getElementById("selectionOverlay");
 const brushPreviewDot = document.getElementById("brushPreviewDot");
 const paintColorPanel = document.getElementById("paintColorPanel");
 const paintHueWheel = document.getElementById("paintHueWheel");
@@ -341,6 +344,11 @@ const state = {
   projectAutosaveTimer: 0,
   zoom: 80,
   viewport: { x: 0, y: 0 },
+  activeTool: "brush",
+  marqueeMode: "rectangle",
+  manualSelection: null,
+  manualInteraction: null,
+  layerTransform: null,
   renderQueued: false,
   paintPointerId: null,
   panPointerId: null,
@@ -424,6 +432,10 @@ const gpu = {
   flatNormal: null,
   blackRoughness: null,
   blackMetalness: null,
+  manualSelectionTexture: null,
+  manualSelectionSource: null,
+  manualSelectionWidth: 0,
+  manualSelectionHeight: 0,
 };
 
 const VERTEX_SHADER = `#version 300 es
@@ -779,6 +791,8 @@ precision highp float;
 in vec2 vUv;
 out vec4 outColor;
 uniform sampler2D uSource;
+uniform sampler2D uSelection;
+uniform float uUseSelection;
 uniform vec2 uResolution;
 uniform vec3 uColor;
 uniform vec4 uDabs[64];
@@ -820,7 +834,8 @@ void main() {
       : 0.0;
     remaining *= 1.0 - dabStrength;
   }
-  float strength = 1.0 - remaining;
+  float selection = uUseSelection > 0.5 ? texture(uSelection, vUv).r : 1.0;
+  float strength = (1.0 - remaining) * selection;
   if (uForceOpaque > 0.5) {
     float height = uErase > 0.5
       ? mix(destination.r, 0.0, strength)
@@ -848,6 +863,8 @@ precision highp float;
 in vec2 vUv;
 out vec4 outColor;
 uniform sampler2D uSource;
+uniform sampler2D uSelection;
+uniform float uUseSelection;
 uniform vec2 uResolution;
 uniform vec2 uCenter;
 uniform vec2 uAxis;
@@ -906,6 +923,7 @@ void main() {
       * clamp(resolvedBrushStrength(vec2(normalizedX, normalizedY), distanceToCenter), 0.0, 1.0)
       * brushEdgeFade(distanceToCenter)
   );
+  strength *= uUseSelection > 0.5 ? texture(uSelection, vUv).r : 1.0;
   if (uForceOpaque > 0.5) {
     float height = uErase > 0.5
       ? mix(destination.r, 0.0, strength)
@@ -934,6 +952,8 @@ in vec2 vUv;
 out vec4 outColor;
 uniform sampler2D uMaskSource;
 uniform sampler2D uMaskBase;
+uniform sampler2D uSelection;
+uniform float uUseSelection;
 uniform vec2 uResolution;
 uniform vec4 uDabs[64];
 uniform int uDabCount;
@@ -979,6 +999,7 @@ void main() {
       0.0,
       1.0
     ) * brushEdgeFade(distanceToCenter);
+    brushAlpha *= uUseSelection > 0.5 ? texture(uSelection, vUv).r : 1.0;
     float candidate = mix(baseValue, uTarget, min(1.0, dab.w * brushAlpha));
     value = rising ? max(value, candidate) : min(value, candidate);
   }
@@ -990,6 +1011,8 @@ precision highp float;
 in vec2 vUv;
 out vec4 outColor;
 uniform sampler2D uMaskSource;
+uniform sampler2D uSelection;
+uniform float uUseSelection;
 uniform vec2 uResolution;
 uniform vec2 uCenter;
 uniform vec2 uAxis;
@@ -1045,6 +1068,7 @@ void main() {
       * clamp(resolvedBrushStrength(vec2(normalizedX, normalizedY), distanceToCenter), 0.0, 1.0)
       * brushEdgeFade(distanceToCenter)
   );
+  strength *= uUseSelection > 0.5 ? texture(uSelection, vUv).r : 1.0;
   outColor = vec4(mix(value, uTarget, strength), 0.0, 0.0, 1.0);
 }`;
 
@@ -1184,6 +1208,7 @@ uniform sampler2D uBoundMask;
 uniform sampler2D uClip;
 uniform float uOpacity;
 uniform int uMode;
+uniform bool uAdjustment;
 uniform bool uUseMask;
 uniform bool uUseBoundMask;
 uniform bool uMaskEnabled;
@@ -1292,11 +1317,21 @@ void main() {
     maskValue *= uMaskOpacity;
   }
   float clipAlpha = uClipDown ? texture(uClip, vUv).a : 1.0;
+  if (uAdjustment) {
+    float effectAmount = clamp(maskValue * clipAlpha * uOpacity, 0.0, 1.0);
+    vec3 adjusted = blendColor(base.rgb, layer.rgb, uMode);
+    outColor = base.a > 0.0
+      ? vec4(mix(base.rgb, adjusted, effectAmount), base.a)
+      : vec4(0.0);
+    return;
+  }
   float sourceAlpha = clamp(layer.a * maskValue * clipAlpha * uOpacity, 0.0, 1.0);
   vec3 blended = blendColor(base.rgb, layer.rgb, uMode);
+  // A blend mode interacts only with the covered portion of the backdrop.
+  vec3 sourceColor = mix(layer.rgb, blended, base.a);
   float outAlpha = sourceAlpha + base.a * (1.0 - sourceAlpha);
   vec3 outRgb = outAlpha > 0.0
-    ? (blended * sourceAlpha + base.rgb * base.a * (1.0 - sourceAlpha)) / outAlpha
+    ? (sourceColor * sourceAlpha + base.rgb * base.a * (1.0 - sourceAlpha)) / outAlpha
     : vec3(0.0);
   outColor = vec4(outRgb, outAlpha);
 }`;
@@ -1787,7 +1822,10 @@ function setDocumentDimensions(width, height) {
   const dimensionsChanged = nextWidth !== DOC_WIDTH || nextHeight !== DOC_HEIGHT;
   DOC_WIDTH = nextWidth;
   DOC_HEIGHT = nextHeight;
-  if (dimensionsChanged) rebuildDocumentTargets();
+  if (dimensionsChanged) {
+    destroyManualSelectionTexture();
+    rebuildDocumentTargets();
+  }
   canvasWrap.style.aspectRatio = `${DOC_WIDTH} / ${DOC_HEIGHT}`;
   syncCanvasPresentation();
   document.getElementById("documentSize").textContent = `${DOC_WIDTH} x ${DOC_HEIGHT}`;
@@ -1801,6 +1839,7 @@ function syncCanvasPresentation() {
   const height = width / documentRatio;
   canvasWrap.style.width = `${Math.round(width)}px`;
   canvasWrap.style.height = `${Math.round(height)}px`;
+  drawManualEditingOverlay();
 }
 
 function bindTexture(program, name, texture, unit) {
@@ -2653,6 +2692,9 @@ function renderDocument(forcedSize = null) {
     const transformPreview = state.paintTransformStroke?.layerId === layer.id
       ? state.paintTransformStroke.previewTexture
       : null;
+    const manualTransformPreview = state.layerTransform?.layerId === layer.id
+      ? state.layerTransform.previewTexture
+      : null;
     const boundMaskTexture = renderBoundMaskTexture(layer);
     const materialTexture = isMaterial ? renderMaterialLayer(layer, baseTexture) : null;
     const heightTexture = isHeight
@@ -2667,7 +2709,7 @@ function renderDocument(forcedSize = null) {
     const layerTexture = renderLayerFilters(
       layer,
       timeSeconds,
-      isAdjustment ? adjustmentSource : (materialTexture || heightTexture || transformPreview),
+      isAdjustment ? adjustmentSource : (materialTexture || heightTexture || manualTransformPreview || transformPreview),
       (isAdjustment || derivativeDisplacement)
         ? { penetrationSource: isAdjustment ? adjustmentSource : baseTexture }
         : undefined,
@@ -2693,6 +2735,7 @@ function renderDocument(forcedSize = null) {
       gl.getUniformLocation(gpu.compositeProgram, "uMode"),
       BLEND_MODE_CODES[blendModeId] ?? 0,
     );
+    gl.uniform1i(gl.getUniformLocation(gpu.compositeProgram, "uAdjustment"), isAdjustment ? 1 : 0);
     gl.uniform1i(gl.getUniformLocation(gpu.compositeProgram, "uUseMask"), visibleMask ? 1 : 0);
     gl.uniform1i(gl.getUniformLocation(gpu.compositeProgram, "uUseBoundMask"), boundMaskTexture ? 1 : 0);
     gl.uniform1i(gl.getUniformLocation(gpu.compositeProgram, "uMaskEnabled"), visibleMask?.enabled ? 1 : 0);
@@ -3003,6 +3046,7 @@ function stampPaintLayerGpu(layer, dabs, color, erasing, brushStyle, brushSeed) 
   gl.useProgram(gpu.paintBrushProgram);
   bindTexture(gpu.paintBrushProgram, "uSource", layer.sourceTexture, 0);
   bindBrushTexture(gpu.paintBrushProgram, getBrushPreset(), 1);
+  bindManualSelection(gpu.paintBrushProgram, 2, layer);
   gl.uniform2f(gl.getUniformLocation(gpu.paintBrushProgram, "uResolution"), DOC_WIDTH, DOC_HEIGHT);
   gl.uniform3f(gl.getUniformLocation(gpu.paintBrushProgram, "uColor"), color[0] / 255, color[1] / 255, color[2] / 255);
   gl.uniform4fv(
@@ -3182,12 +3226,14 @@ function schedulePaintLayerSerialization(layer) {
 }
 
 function hasDirtyPaintLayerDataUrls() {
-  return state.layers.some((layer) => (layer.kind === "paint" || layer.kind === "height") && layer.sourceDataUrlDirty);
+  return state.layers.some((layer) => (
+    layer.kind === "image" || layer.kind === "paint" || layer.kind === "height"
+  ) && layer.sourceDataUrlDirty);
 }
 
 function flushDirtyPaintLayerDataUrls() {
   state.layers.forEach((layer) => {
-    if ((layer.kind !== "paint" && layer.kind !== "height") || !layer.sourceDataUrlDirty) return;
+    if (!["image", "paint", "height"].includes(layer.kind) || !layer.sourceDataUrlDirty) return;
     window.clearTimeout(layer.sourceSerializationTimer);
     layer.sourceDataUrl = canvasToPortableDataUrl(layer.sourceCanvas);
     layer.sourceDataUrlDirty = false;
@@ -3391,6 +3437,7 @@ function stampMaskGpu(mask, dabs, target, dirty) {
   bindTexture(gpu.maskBrushProgram, "uMaskSource", mask.texture, 0);
   bindBrushTexture(gpu.maskBrushProgram, preset, 1);
   bindTexture(gpu.maskBrushProgram, "uMaskBase", state.strokeHistory?.baseTexture || mask.texture, 2);
+  bindManualSelection(gpu.maskBrushProgram, 3, getSelectedLayer());
   gl.uniform2f(gl.getUniformLocation(gpu.maskBrushProgram, "uResolution"), DOC_WIDTH, DOC_HEIGHT);
   gl.uniform4fv(
     gl.getUniformLocation(gpu.maskBrushProgram, "uDabs[0]"),
@@ -3465,6 +3512,874 @@ function pointerToDocument(event) {
   const reportedPressure = Number.isFinite(event.pressure) ? event.pressure : 0.5;
   const pressure = event.pointerType === "mouse" ? 0.68 : Math.max(0.08, reportedPressure);
   return { x, y, pressure };
+}
+
+function isManualEditableLayer(layer = getSelectedLayer()) {
+  return Boolean(layer && (layer.kind === "image" || layer.kind === "paint"));
+}
+
+function clampDocumentPoint(point) {
+  return {
+    x: Math.max(0, Math.min(DOC_WIDTH, point.x)),
+    y: Math.max(0, Math.min(DOC_HEIGHT, point.y)),
+  };
+}
+
+function selectionBounds(selection) {
+  if (!selection?.points?.length) return null;
+  const extents = selection.points.reduce((result, point) => ({
+    minX: Math.min(result.minX, point.x),
+    minY: Math.min(result.minY, point.y),
+    maxX: Math.max(result.maxX, point.x),
+    maxY: Math.max(result.maxY, point.y),
+  }), { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity });
+  const x0 = Math.max(0, Math.floor(extents.minX));
+  const y0 = Math.max(0, Math.floor(extents.minY));
+  const x1 = Math.min(DOC_WIDTH, Math.ceil(extents.maxX));
+  const y1 = Math.min(DOC_HEIGHT, Math.ceil(extents.maxY));
+  if (x1 <= x0 || y1 <= y0) return null;
+  return {
+    x0,
+    y0,
+    x1,
+    y1,
+    width: x1 - x0,
+    height: y1 - y0,
+    canvasY: DOC_HEIGHT - y1,
+  };
+}
+
+function rectangularSelection(start, end) {
+  const x0 = Math.min(start.x, end.x);
+  const x1 = Math.max(start.x, end.x);
+  const y0 = Math.min(start.y, end.y);
+  const y1 = Math.max(start.y, end.y);
+  return {
+    layerId: getSelectedLayer()?.id || null,
+    type: "rectangle",
+    closed: true,
+    points: [
+      { x: x0, y: y1 },
+      { x: x1, y: y1 },
+      { x: x1, y: y0 },
+      { x: x0, y: y0 },
+    ],
+  };
+}
+
+function selectionPath(selection, offsetX = 0, offsetY = 0) {
+  const path = new Path2D();
+  if (!selection?.points?.length) return path;
+  selection.points.forEach((point, index) => {
+    const x = point.x - offsetX;
+    const y = DOC_HEIGHT - point.y - offsetY;
+    if (index === 0) path.moveTo(x, y);
+    else path.lineTo(x, y);
+  });
+  if (selection.closed !== false) path.closePath();
+  return path;
+}
+
+function activeManualSelection(layer = getSelectedLayer()) {
+  return state.manualSelection?.layerId === layer?.id && state.manualSelection.closed !== false
+    ? state.manualSelection
+    : null;
+}
+
+function destroyManualSelectionTexture() {
+  if (gpu.manualSelectionTexture) gl.deleteTexture(gpu.manualSelectionTexture);
+  gpu.manualSelectionTexture = null;
+  gpu.manualSelectionSource = null;
+  gpu.manualSelectionWidth = 0;
+  gpu.manualSelectionHeight = 0;
+}
+
+function ensureManualSelectionTexture(layer) {
+  const selection = activeManualSelection(layer);
+  if (!selection) {
+    destroyManualSelectionTexture();
+    return null;
+  }
+  if (
+    gpu.manualSelectionTexture
+    && gpu.manualSelectionSource === selection
+    && gpu.manualSelectionWidth === DOC_WIDTH
+    && gpu.manualSelectionHeight === DOC_HEIGHT
+  ) {
+    return gpu.manualSelectionTexture;
+  }
+  destroyManualSelectionTexture();
+  const selectionCanvas = document.createElement("canvas");
+  selectionCanvas.width = DOC_WIDTH;
+  selectionCanvas.height = DOC_HEIGHT;
+  const context = selectionCanvas.getContext("2d", { alpha: true, willReadFrequently: true });
+  context.fillStyle = "#ffffff";
+  context.fill(selectionPath(selection));
+  const rgba = context.getImageData(0, 0, DOC_WIDTH, DOC_HEIGHT).data;
+  const mask = new Uint8Array(DOC_WIDTH * DOC_HEIGHT);
+  for (let y = 0; y < DOC_HEIGHT; y += 1) {
+    const targetOffset = y * DOC_WIDTH;
+    const sourceOffset = ((DOC_HEIGHT - 1 - y) * DOC_WIDTH) * 4 + 3;
+    for (let x = 0; x < DOC_WIDTH; x += 1) {
+      mask[targetOffset + x] = rgba[sourceOffset + x * 4];
+    }
+  }
+  gpu.manualSelectionTexture = createTexture(DOC_WIDTH, DOC_HEIGHT, mask, gl.R8, gl.RED);
+  gpu.manualSelectionSource = selection;
+  gpu.manualSelectionWidth = DOC_WIDTH;
+  gpu.manualSelectionHeight = DOC_HEIGHT;
+  return gpu.manualSelectionTexture;
+}
+
+function bindManualSelection(program, textureUnit, layer) {
+  const texture = ensureManualSelectionTexture(layer);
+  bindTexture(program, "uSelection", texture || gpu.whiteMask, textureUnit);
+  gl.uniform1f(gl.getUniformLocation(program, "uUseSelection"), texture ? 1 : 0);
+}
+
+function clearManualSelection() {
+  if (state.layerTransform) cancelLayerTransform();
+  releaseManualPointerCapture();
+  state.manualSelection = null;
+  state.manualInteraction = null;
+  destroyManualSelectionTexture();
+  drawManualEditingOverlay();
+}
+
+function syncManualToolUi() {
+  const editable = isManualEditableLayer();
+  if (!editable && state.activeTool !== "brush") state.activeTool = "brush";
+  manualTools.querySelectorAll("[data-manual-tool]").forEach((button) => {
+    const tool = button.dataset.manualTool;
+    button.disabled = tool !== "brush" && !editable;
+    const active = tool === state.activeTool;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
+  manualToolOptions.hidden = state.activeTool !== "marquee" || !editable;
+  manualToolOptions.querySelectorAll("[data-marquee-mode]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.marqueeMode === state.marqueeMode);
+  });
+  canvas.classList.toggle("is-transforming", state.activeTool === "transform" && editable);
+  canvas.classList.toggle("is-selecting", state.activeTool === "marquee" && editable);
+  canvas.classList.toggle("is-filling", state.activeTool === "fill" && editable);
+}
+
+function setActiveManualTool(tool) {
+  const layer = getSelectedLayer();
+  const leavingTransform = state.activeTool === "transform" && tool !== "transform";
+  if (state.manualInteraction) return;
+  if (tool !== "brush" && !isManualEditableLayer(layer)) {
+    showToast("Select a Base image or Paint layer to use this tool.");
+    return;
+  }
+  if (state.layerTransform && tool !== "transform") commitLayerTransform();
+  if (leavingTransform) clearManualSelection();
+  state.activeTool = tool;
+  if (tool !== "brush" && layer) {
+    state.selectionPart = "content";
+  } else if (tool === "brush" && layer?.kind === "image" && layer.mask) {
+    state.selectionPart = "mask";
+  }
+  state.manualInteraction = null;
+  syncManualToolUi();
+  syncCanvasCursor();
+  syncBrushUi();
+  renderLayers();
+  if (tool === "transform") beginLayerTransform();
+  else drawManualEditingOverlay();
+}
+
+function overlayPoint(point) {
+  const width = canvas.clientWidth;
+  const height = canvas.clientHeight;
+  return {
+    x: point.x / DOC_WIDTH * width,
+    y: (1 - point.y / DOC_HEIGHT) * height,
+  };
+}
+
+function mapPointToQuad(point, bounds, corners) {
+  const u = (point.x - bounds.x0) / Math.max(1, bounds.width);
+  const v = (bounds.y1 - point.y) / Math.max(1, bounds.height);
+  const top = {
+    x: corners[0].x + (corners[1].x - corners[0].x) * u,
+    y: corners[0].y + (corners[1].y - corners[0].y) * u,
+  };
+  const bottom = {
+    x: corners[3].x + (corners[2].x - corners[3].x) * u,
+    y: corners[3].y + (corners[2].y - corners[3].y) * u,
+  };
+  return {
+    x: top.x + (bottom.x - top.x) * v,
+    y: top.y + (bottom.y - top.y) * v,
+  };
+}
+
+function affineFromTriangles(source, destination) {
+  const [s0, s1, s2] = source;
+  const [d0, d1, d2] = destination;
+  const determinant = s0.x * (s1.y - s2.y) + s1.x * (s2.y - s0.y) + s2.x * (s0.y - s1.y);
+  if (Math.abs(determinant) < 1e-8) return null;
+  const matrixFor = (v0, v1, v2) => ({
+    first: (v0 * (s1.y - s2.y) + v1 * (s2.y - s0.y) + v2 * (s0.y - s1.y)) / determinant,
+    second: (v0 * (s2.x - s1.x) + v1 * (s0.x - s2.x) + v2 * (s1.x - s0.x)) / determinant,
+    offset: (
+      v0 * (s1.x * s2.y - s2.x * s1.y)
+      + v1 * (s2.x * s0.y - s0.x * s2.y)
+      + v2 * (s0.x * s1.y - s1.x * s0.y)
+    ) / determinant,
+  });
+  const x = matrixFor(d0.x, d1.x, d2.x);
+  const y = matrixFor(d0.y, d1.y, d2.y);
+  return { a: x.first, b: y.first, c: x.second, d: y.second, e: x.offset, f: y.offset };
+}
+
+function drawImageTriangle(context, image, source, destination) {
+  const matrix = affineFromTriangles(source, destination);
+  if (!matrix) return;
+  context.save();
+  context.beginPath();
+  context.moveTo(destination[0].x, destination[0].y);
+  context.lineTo(destination[1].x, destination[1].y);
+  context.lineTo(destination[2].x, destination[2].y);
+  context.closePath();
+  context.clip();
+  context.transform(matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f);
+  context.drawImage(image, 0, 0);
+  context.restore();
+}
+
+function drawQuadImage(context, image, corners) {
+  const source = [
+    { x: 0, y: 0 },
+    { x: image.width, y: 0 },
+    { x: image.width, y: image.height },
+    { x: 0, y: image.height },
+  ];
+  const parallelogramError = Math.hypot(
+    corners[0].x + corners[2].x - corners[1].x - corners[3].x,
+    corners[0].y + corners[2].y - corners[1].y - corners[3].y,
+  );
+  if (parallelogramError < 0.01) {
+    const matrix = affineFromTriangles(
+      [source[0], source[1], source[3]],
+      [corners[0], corners[1], corners[3]],
+    );
+    if (!matrix) return;
+    context.save();
+    context.beginPath();
+    corners.forEach((point, index) => {
+      if (index === 0) context.moveTo(point.x, point.y);
+      else context.lineTo(point.x, point.y);
+    });
+    context.closePath();
+    context.clip();
+    context.transform(matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f);
+    context.drawImage(image, 0, 0);
+    context.restore();
+    return;
+  }
+  drawImageTriangle(context, image, [source[0], source[1], source[2]], [corners[0], corners[1], corners[2]]);
+  drawImageTriangle(context, image, [source[0], source[2], source[3]], [corners[0], corners[2], corners[3]]);
+}
+
+function transformedSelectionPoints(transform) {
+  return transform.outline.map((point) => mapPointToQuad(point, transform.bounds, transform.corners));
+}
+
+function transformHandlePoints(transform) {
+  const corners = transform.corners;
+  return [
+    ...corners,
+    {
+      x: (corners[0].x + corners[1].x) / 2,
+      y: (corners[0].y + corners[1].y) / 2,
+    },
+    {
+      x: (corners[1].x + corners[2].x) / 2,
+      y: (corners[1].y + corners[2].y) / 2,
+    },
+    {
+      x: (corners[2].x + corners[3].x) / 2,
+      y: (corners[2].y + corners[3].y) / 2,
+    },
+    {
+      x: (corners[3].x + corners[0].x) / 2,
+      y: (corners[3].y + corners[0].y) / 2,
+    },
+  ];
+}
+
+function transformRotationHandle(transform) {
+  const corners = transform.corners;
+  const top = {
+    x: (corners[0].x + corners[1].x) / 2,
+    y: (corners[0].y + corners[1].y) / 2,
+  };
+  const center = corners.reduce(
+    (result, corner) => ({ x: result.x + corner.x / 4, y: result.y + corner.y / 4 }),
+    { x: 0, y: 0 },
+  );
+  const length = Math.hypot(top.x - center.x, top.y - center.y) || 1;
+  const documentOffset = 26 / Math.max(1, canvas.clientHeight) * DOC_HEIGHT;
+  const direction = { x: (top.x - center.x) / length, y: (top.y - center.y) / length };
+  let handle = {
+    x: top.x + direction.x * documentOffset,
+    y: top.y + direction.y * documentOffset,
+  };
+  if (handle.x < 0 || handle.x > DOC_WIDTH || handle.y < 0 || handle.y > DOC_HEIGHT) {
+    handle = {
+      x: top.x - direction.x * documentOffset,
+      y: top.y - direction.y * documentOffset,
+    };
+  }
+  return { anchor: top, handle };
+}
+
+function drawSelectionOutline(context, points, incomplete = false) {
+  if (!points?.length) return;
+  context.save();
+  context.beginPath();
+  points.forEach((point, index) => {
+    const overlay = overlayPoint(point);
+    if (index === 0) context.moveTo(overlay.x, overlay.y);
+    else context.lineTo(overlay.x, overlay.y);
+  });
+  if (!incomplete) context.closePath();
+  context.lineWidth = 2;
+  context.setLineDash([6, 4]);
+  context.strokeStyle = "rgba(0, 0, 0, 0.85)";
+  context.stroke();
+  context.lineDashOffset = 5;
+  context.lineWidth = 1;
+  context.strokeStyle = "rgba(246, 250, 244, 0.95)";
+  context.stroke();
+  context.restore();
+}
+
+function drawManualEditingOverlay() {
+  const cssWidth = canvas.clientWidth;
+  const cssHeight = canvas.clientHeight;
+  if (!cssWidth || !cssHeight) {
+    selectionOverlay.width = 1;
+    selectionOverlay.height = 1;
+    return;
+  }
+  const ratio = Math.min(window.devicePixelRatio || 1, 2);
+  const width = Math.max(1, Math.round(cssWidth * ratio));
+  const height = Math.max(1, Math.round(cssHeight * ratio));
+  if (selectionOverlay.width !== width || selectionOverlay.height !== height) {
+    selectionOverlay.width = width;
+    selectionOverlay.height = height;
+  }
+  const context = selectionOverlay.getContext("2d");
+  context.setTransform(1, 0, 0, 1, 0, 0);
+  context.clearRect(0, 0, width, height);
+  context.scale(ratio, ratio);
+  const transform = state.layerTransform;
+  if (transform) {
+    drawSelectionOutline(context, transformedSelectionPoints(transform));
+    const handles = transformHandlePoints(transform);
+    context.save();
+    context.fillStyle = "#f3f7f0";
+    context.strokeStyle = "#28312d";
+    context.lineWidth = 1;
+    handles.forEach((point) => {
+      const overlay = overlayPoint(point);
+      context.beginPath();
+      context.rect(overlay.x - 4, overlay.y - 4, 8, 8);
+      context.fill();
+      context.stroke();
+    });
+    const rotation = transformRotationHandle(transform);
+    const anchor = overlayPoint(rotation.anchor);
+    const rotationHandle = overlayPoint(rotation.handle);
+    context.beginPath();
+    context.moveTo(anchor.x, anchor.y);
+    context.lineTo(rotationHandle.x, rotationHandle.y);
+    context.stroke();
+    context.beginPath();
+    context.arc(rotationHandle.x, rotationHandle.y, 5, 0, Math.PI * 2);
+    context.fill();
+    context.stroke();
+    context.restore();
+    return;
+  }
+  const selection = state.manualSelection;
+  if (selection) drawSelectionOutline(context, selection.points, selection.closed === false);
+}
+
+function uploadEditableLayerSource(layer) {
+  ensureLayerGpuTextures(layer);
+  gl.bindTexture(gl.TEXTURE_2D, layer.sourceTexture);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, layer.sourceCanvas);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  layer.sourceRevision = (layer.sourceRevision || 0) + 1;
+  invalidateLayerThumbnail(layer);
+  requestRender();
+}
+
+function layerContentBounds(layer) {
+  if (layer.kind === "image") {
+    return { x0: 0, y0: 0, x1: DOC_WIDTH, y1: DOC_HEIGHT, width: DOC_WIDTH, height: DOC_HEIGHT, canvasY: 0 };
+  }
+  if (layer.contentBoundsRevision === layer.sourceRevision && layer.contentBounds) {
+    return { ...layer.contentBounds };
+  }
+  const context = layer.sourceCanvas.getContext("2d", { alpha: true, willReadFrequently: true });
+  const pixels = context.getImageData(0, 0, DOC_WIDTH, DOC_HEIGHT).data;
+  let minX = DOC_WIDTH;
+  let minY = DOC_HEIGHT;
+  let maxX = -1;
+  let maxY = -1;
+  for (let y = 0; y < DOC_HEIGHT; y += 1) {
+    for (let x = 0; x < DOC_WIDTH; x += 1) {
+      if (pixels[(y * DOC_WIDTH + x) * 4 + 3] === 0) continue;
+      minX = Math.min(minX, x);
+      minY = Math.min(minY, y);
+      maxX = Math.max(maxX, x);
+      maxY = Math.max(maxY, y);
+    }
+  }
+  if (maxX < minX || maxY < minY) {
+    layer.contentBounds = { x0: 0, y0: 0, x1: DOC_WIDTH, y1: DOC_HEIGHT, width: DOC_WIDTH, height: DOC_HEIGHT, canvasY: 0 };
+    layer.contentBoundsRevision = layer.sourceRevision;
+    return { ...layer.contentBounds };
+  }
+  layer.contentBounds = {
+    x0: minX,
+    y0: DOC_HEIGHT - maxY - 1,
+    x1: maxX + 1,
+    y1: DOC_HEIGHT - minY,
+    width: maxX - minX + 1,
+    height: maxY - minY + 1,
+    canvasY: minY,
+  };
+  layer.contentBoundsRevision = layer.sourceRevision;
+  return { ...layer.contentBounds };
+}
+
+function selectionFromBounds(layerId, bounds) {
+  const selection = rectangularSelection(
+    { x: bounds.x0, y: bounds.y0 },
+    { x: bounds.x1, y: bounds.y1 },
+  );
+  selection.layerId = layerId;
+  return selection;
+}
+
+function beginLayerTransform() {
+  if (state.layerTransform) return;
+  const layer = getSelectedLayer();
+  if (!isManualEditableLayer(layer)) return;
+  flushPendingPaintDabs();
+  const selected = activeManualSelection(layer);
+  const bounds = selected ? selectionBounds(selected) : layerContentBounds(layer);
+  if (!bounds) {
+    showToast("There is no selected content to transform.");
+    return;
+  }
+  const effectiveSelection = selected || selectionFromBounds(layer.id, bounds);
+  const sourceContext = layer.sourceCanvas.getContext("2d", { alpha: true, willReadFrequently: true });
+  const sourceBefore = sourceContext.getImageData(bounds.x0, bounds.canvasY, bounds.width, bounds.height);
+  const contentCanvas = document.createElement("canvas");
+  contentCanvas.width = bounds.width;
+  contentCanvas.height = bounds.height;
+  const contentContext = contentCanvas.getContext("2d", { alpha: true });
+  contentContext.save();
+  contentContext.clip(selectionPath(effectiveSelection, bounds.x0, bounds.canvasY));
+  contentContext.drawImage(layer.sourceCanvas, -bounds.x0, -bounds.canvasY);
+  contentContext.restore();
+  sourceContext.save();
+  sourceContext.globalCompositeOperation = "destination-out";
+  sourceContext.fill(selectionPath(effectiveSelection));
+  sourceContext.restore();
+  uploadEditableLayerSource(layer);
+  state.layerTransform = {
+    layerId: layer.id,
+    bounds,
+    originalSelection: selected ? cloneHistoryValue(selected) : null,
+    sourceWasDirty: layer.sourceDataUrlDirty === true,
+    sourceBefore,
+    contentCanvas,
+    outline: effectiveSelection.points.map((point) => ({ ...point })),
+    corners: [
+      { x: bounds.x0, y: bounds.y1 },
+      { x: bounds.x1, y: bounds.y1 },
+      { x: bounds.x1, y: bounds.y0 },
+      { x: bounds.x0, y: bounds.y0 },
+    ],
+  };
+  updateLayerTransformPreview();
+  drawManualEditingOverlay();
+}
+
+function updateLayerTransformPreview() {
+  const transform = state.layerTransform;
+  const layer = state.layers.find((item) => item.id === transform?.layerId);
+  if (!transform || !layer) return;
+  if (!transform.previewCanvas) {
+    transform.previewCanvas = document.createElement("canvas");
+    transform.previewCanvas.width = DOC_WIDTH;
+    transform.previewCanvas.height = DOC_HEIGHT;
+  }
+  const context = transform.previewCanvas.getContext("2d", { alpha: true });
+  context.clearRect(0, 0, DOC_WIDTH, DOC_HEIGHT);
+  context.drawImage(layer.sourceCanvas, 0, 0);
+  const canvasCorners = transform.corners.map((point) => ({ x: point.x, y: DOC_HEIGHT - point.y }));
+  drawQuadImage(context, transform.contentCanvas, canvasCorners);
+  if (!transform.previewTexture) {
+    transform.previewTexture = textureFromCanvas(transform.previewCanvas);
+  } else {
+    gl.bindTexture(gl.TEXTURE_2D, transform.previewTexture);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, transform.previewCanvas);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  }
+  requestRender();
+}
+
+function releaseLayerTransformPreview(transform) {
+  if (transform?.previewTexture) gl.deleteTexture(transform.previewTexture);
+  if (transform) {
+    transform.previewTexture = null;
+    transform.previewCanvas = null;
+  }
+}
+
+function restoreTransformSource(transform) {
+  const layer = state.layers.find((item) => item.id === transform.layerId);
+  if (!layer) return;
+  const context = layer.sourceCanvas.getContext("2d", { alpha: true });
+  context.putImageData(transform.sourceBefore, transform.bounds.x0, transform.bounds.canvasY);
+  uploadEditableLayerSource(layer);
+  if (transform.sourceWasDirty) schedulePaintLayerSerialization(layer);
+}
+
+function cancelLayerTransform() {
+  const transform = state.layerTransform;
+  if (!transform) return;
+  releaseManualPointerCapture();
+  restoreTransformSource(transform);
+  releaseLayerTransformPreview(transform);
+  state.layerTransform = null;
+  state.manualInteraction = null;
+  drawManualEditingOverlay();
+}
+
+function releaseManualPointerCapture() {
+  const pointerId = state.manualInteraction?.pointerId;
+  if (pointerId === undefined || pointerId === null) return;
+  if (canvas.hasPointerCapture(pointerId)) canvas.releasePointerCapture(pointerId);
+}
+
+function unionTransformBounds(transform) {
+  const xs = [transform.bounds.x0, transform.bounds.x1, ...transform.corners.map((point) => point.x)];
+  const ys = [transform.bounds.y0, transform.bounds.y1, ...transform.corners.map((point) => point.y)];
+  const x0 = Math.max(0, Math.floor(Math.min(...xs)));
+  const y0 = Math.max(0, Math.floor(Math.min(...ys)));
+  const x1 = Math.min(DOC_WIDTH, Math.ceil(Math.max(...xs)));
+  const y1 = Math.min(DOC_HEIGHT, Math.ceil(Math.max(...ys)));
+  return { x0, y0, x1, y1, width: x1 - x0, height: y1 - y0, canvasY: DOC_HEIGHT - y1 };
+}
+
+function commitLayerTransform() {
+  const transform = state.layerTransform;
+  const layer = state.layers.find((item) => item.id === transform?.layerId);
+  if (!transform || !layer) return;
+  const unchanged = transform.corners.every((corner, index) => (
+    corner.x === [
+      transform.bounds.x0,
+      transform.bounds.x1,
+      transform.bounds.x1,
+      transform.bounds.x0,
+    ][index]
+    && corner.y === [
+      transform.bounds.y1,
+      transform.bounds.y1,
+      transform.bounds.y0,
+      transform.bounds.y0,
+    ][index]
+  ));
+  if (unchanged) {
+    cancelLayerTransform();
+    return;
+  }
+  const region = unionTransformBounds(transform);
+  const context = layer.sourceCanvas.getContext("2d", { alpha: true, willReadFrequently: true });
+  const beforeCanvas = document.createElement("canvas");
+  beforeCanvas.width = region.width;
+  beforeCanvas.height = region.height;
+  const beforeContext = beforeCanvas.getContext("2d", { alpha: true });
+  beforeContext.putImageData(
+    context.getImageData(region.x0, region.canvasY, region.width, region.height),
+    0,
+    0,
+  );
+  beforeContext.putImageData(
+    transform.sourceBefore,
+    transform.bounds.x0 - region.x0,
+    transform.bounds.canvasY - region.canvasY,
+  );
+  const before = new Uint8Array(beforeContext.getImageData(0, 0, region.width, region.height).data);
+  const canvasCorners = transform.corners.map((point) => ({ x: point.x, y: DOC_HEIGHT - point.y }));
+  drawQuadImage(context, transform.contentCanvas, canvasCorners);
+  const after = new Uint8Array(context.getImageData(region.x0, region.canvasY, region.width, region.height).data);
+  const transformedSelection = {
+    layerId: layer.id,
+    type: "polygon",
+    closed: true,
+    points: transformedSelectionPoints(transform).map(clampDocumentPoint),
+  };
+  releaseLayerTransformPreview(transform);
+  state.manualSelection = transformedSelection;
+  state.layerTransform = null;
+  state.manualInteraction = null;
+  uploadEditableLayerSource(layer);
+  schedulePaintLayerSerialization(layer);
+  recordPaintRegionHistoryAction(layer.id, {
+    x: region.x0,
+    y: region.y0,
+    width: region.width,
+    height: region.height,
+    canvasY: region.canvasY,
+  }, before, after, transform.originalSelection, transformedSelection);
+  refreshLayerThumbnail(layer);
+  renderLayers();
+  drawManualEditingOverlay();
+}
+
+function pointInPolygon(point, polygon) {
+  let inside = false;
+  for (let index = 0, previous = polygon.length - 1; index < polygon.length; previous = index, index += 1) {
+    const a = polygon[index];
+    const b = polygon[previous];
+    const crosses = (a.y > point.y) !== (b.y > point.y)
+      && point.x < (b.x - a.x) * (point.y - a.y) / ((b.y - a.y) || 1e-8) + a.x;
+    if (crosses) inside = !inside;
+  }
+  return inside;
+}
+
+function transformHandleAt(event) {
+  const transform = state.layerTransform;
+  if (!transform) return -1;
+  const pointer = { x: event.clientX, y: event.clientY };
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = rect.width / Math.max(1, canvas.clientWidth);
+  const scaleY = rect.height / Math.max(1, canvas.clientHeight);
+  const handles = [...transformHandlePoints(transform), transformRotationHandle(transform).handle].map((point) => {
+    const overlay = overlayPoint(point);
+    return { x: rect.left + overlay.x * scaleX, y: rect.top + overlay.y * scaleY };
+  });
+  return handles.findIndex((point) => Math.hypot(point.x - pointer.x, point.y - pointer.y) <= 11);
+}
+
+function beginTransformInteraction(event) {
+  const transform = state.layerTransform;
+  if (!transform || event.button !== 0) return;
+  event.preventDefault();
+  canvas.setPointerCapture(event.pointerId);
+  const point = clampDocumentPoint(pointerToDocument(event));
+  const handle = transformHandleAt(event);
+  const inside = pointInPolygon(point, transform.corners);
+  state.manualInteraction = {
+    type: handle === 8 ? "rotate" : handle >= 0 ? "resize" : inside ? "move" : "rotate",
+    pointerId: event.pointerId,
+    start: point,
+    handle,
+    corners: transform.corners.map((corner) => ({ ...corner })),
+  };
+}
+
+function resizeTransform(point, event) {
+  const interaction = state.manualInteraction;
+  const transform = state.layerTransform;
+  const corners = interaction.corners;
+  const handle = interaction.handle;
+  if (event.ctrlKey || event.metaKey) {
+    if (handle < 4) transform.corners[handle] = point;
+    return;
+  }
+  const uxLength = Math.hypot(corners[1].x - corners[0].x, corners[1].y - corners[0].y) || 1;
+  const vxLength = Math.hypot(corners[3].x - corners[0].x, corners[3].y - corners[0].y) || 1;
+  const ux = { x: (corners[1].x - corners[0].x) / uxLength, y: (corners[1].y - corners[0].y) / uxLength };
+  const vx = { x: (corners[3].x - corners[0].x) / vxLength, y: (corners[3].y - corners[0].y) / vxLength };
+  const oppositeCorner = [2, 3, 0, 1];
+  const oppositeEdge = [6, 7, 4, 5];
+  const pivotIndex = handle < 4 ? oppositeCorner[handle] : oppositeEdge[handle - 4];
+  const pivot = handle < 4
+    ? corners[pivotIndex]
+    : transformHandlePoints({ corners })[pivotIndex];
+  const project = (candidate, axis) => (candidate.x - pivot.x) * axis.x + (candidate.y - pivot.y) * axis.y;
+  const originalHandle = transformHandlePoints({ corners })[handle];
+  let scaleX = project(point, ux) / (project(originalHandle, ux) || 1);
+  let scaleY = project(point, vx) / (project(originalHandle, vx) || 1);
+  if (handle === 4 || handle === 6) scaleX = 1;
+  if (handle === 5 || handle === 7) scaleY = 1;
+  if (handle < 4 && !event.shiftKey) {
+    const uniform = Math.abs(scaleX - 1) >= Math.abs(scaleY - 1) ? scaleX : scaleY;
+    scaleX = uniform;
+    scaleY = uniform;
+  }
+  transform.corners = corners.map((corner) => {
+    const delta = { x: corner.x - pivot.x, y: corner.y - pivot.y };
+    const alongX = delta.x * ux.x + delta.y * ux.y;
+    const alongY = delta.x * vx.x + delta.y * vx.y;
+    return {
+      x: pivot.x + ux.x * alongX * scaleX + vx.x * alongY * scaleY,
+      y: pivot.y + ux.y * alongX * scaleX + vx.y * alongY * scaleY,
+    };
+  });
+}
+
+function continueTransformInteraction(event) {
+  const interaction = state.manualInteraction;
+  const transform = state.layerTransform;
+  if (!interaction || !transform || interaction.pointerId !== event.pointerId) return;
+  event.preventDefault();
+  const point = pointerToDocument(event);
+  if (interaction.type === "move") {
+    const delta = { x: point.x - interaction.start.x, y: point.y - interaction.start.y };
+    transform.corners = interaction.corners.map((corner) => ({ x: corner.x + delta.x, y: corner.y + delta.y }));
+  } else if (interaction.type === "rotate") {
+    const center = interaction.corners.reduce(
+      (result, corner) => ({ x: result.x + corner.x / 4, y: result.y + corner.y / 4 }),
+      { x: 0, y: 0 },
+    );
+    const startAngle = Math.atan2(interaction.start.y - center.y, interaction.start.x - center.x);
+    let angle = Math.atan2(point.y - center.y, point.x - center.x) - startAngle;
+    if (event.shiftKey) angle = Math.round(angle / (Math.PI / 36)) * (Math.PI / 36);
+    const cosine = Math.cos(angle);
+    const sine = Math.sin(angle);
+    transform.corners = interaction.corners.map((corner) => {
+      const x = corner.x - center.x;
+      const y = corner.y - center.y;
+      return { x: center.x + x * cosine - y * sine, y: center.y + x * sine + y * cosine };
+    });
+  } else {
+    resizeTransform(point, event);
+  }
+  updateLayerTransformPreview();
+  drawManualEditingOverlay();
+}
+
+function endTransformInteraction(event) {
+  if (state.manualInteraction?.pointerId !== event.pointerId) return;
+  if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+  state.manualInteraction = null;
+}
+
+function finishPolygonSelection() {
+  const selection = state.manualSelection;
+  if (selection?.type !== "polygon" || selection.closed !== false) return;
+  if (selection.points.length < 3) state.manualSelection = null;
+  else selection.closed = true;
+  state.manualInteraction = null;
+  drawManualEditingOverlay();
+}
+
+function beginMarqueeInteraction(event) {
+  if (event.button !== 0) return;
+  event.preventDefault();
+  const point = clampDocumentPoint(pointerToDocument(event));
+  const layer = getSelectedLayer();
+  if (state.marqueeMode === "polygon") {
+    const selection = state.manualSelection?.type === "polygon"
+      && state.manualSelection.layerId === layer.id
+      && state.manualSelection.closed === false
+      ? state.manualSelection
+      : { layerId: layer.id, type: "polygon", closed: false, points: [] };
+    const first = selection.points[0];
+    const rect = canvas.getBoundingClientRect();
+    const closeDistance = first
+      ? Math.hypot(point.x - first.x, point.y - first.y) / DOC_WIDTH * rect.width
+      : Infinity;
+    if (selection.points.length >= 3 && (event.detail > 1 || closeDistance <= 12)) {
+      state.manualSelection = selection;
+      finishPolygonSelection();
+      return;
+    }
+    selection.points.push(point);
+    state.manualSelection = selection;
+    drawManualEditingOverlay();
+    return;
+  }
+  canvas.setPointerCapture(event.pointerId);
+  state.manualInteraction = {
+    type: "marquee",
+    pointerId: event.pointerId,
+    start: point,
+  };
+  state.manualSelection = state.marqueeMode === "rectangle"
+    ? rectangularSelection(point, point)
+    : { layerId: layer.id, type: "lasso", closed: false, points: [point] };
+  drawManualEditingOverlay();
+}
+
+function continueMarqueeInteraction(event) {
+  const interaction = state.manualInteraction;
+  if (interaction?.type !== "marquee" || interaction.pointerId !== event.pointerId) return;
+  event.preventDefault();
+  const point = clampDocumentPoint(pointerToDocument(event));
+  if (state.marqueeMode === "rectangle") {
+    state.manualSelection = rectangularSelection(interaction.start, point);
+  } else {
+    const points = state.manualSelection.points;
+    const previous = points[points.length - 1];
+    if (Math.hypot(point.x - previous.x, point.y - previous.y) >= Math.max(1, DOC_WIDTH / canvas.clientWidth * 2)) {
+      points.push(point);
+    }
+  }
+  drawManualEditingOverlay();
+}
+
+function endMarqueeInteraction(event) {
+  const interaction = state.manualInteraction;
+  if (interaction?.type !== "marquee" || interaction.pointerId !== event.pointerId) return;
+  if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+  const bounds = selectionBounds(state.manualSelection);
+  if (!bounds || bounds.width < 2 || bounds.height < 2 || state.manualSelection.points.length < 3) {
+    state.manualSelection = null;
+  } else {
+    state.manualSelection.closed = true;
+  }
+  state.manualInteraction = null;
+  drawManualEditingOverlay();
+}
+
+function fillEditableLayer() {
+  const layer = getSelectedLayer();
+  if (!isManualEditableLayer(layer)) return;
+  flushPendingPaintDabs();
+  const selected = activeManualSelection(layer);
+  const selection = selected || rectangularSelection({ x: 0, y: 0 }, { x: DOC_WIDTH, y: DOC_HEIGHT });
+  const bounds = selectionBounds(selection);
+  if (!bounds) return;
+  const context = layer.sourceCanvas.getContext("2d", { alpha: true, willReadFrequently: true });
+  const before = new Uint8Array(context.getImageData(bounds.x0, bounds.canvasY, bounds.width, bounds.height).data);
+  const color = hsvToRgb(state.paintColor.h, state.paintColor.s, state.paintColor.v);
+  context.save();
+  context.clip(selectionPath(selection));
+  if (layer.alphaLock) context.globalCompositeOperation = "source-atop";
+  context.fillStyle = `rgb(${color[0]} ${color[1]} ${color[2]})`;
+  context.fillRect(0, 0, DOC_WIDTH, DOC_HEIGHT);
+  context.restore();
+  const after = new Uint8Array(context.getImageData(bounds.x0, bounds.canvasY, bounds.width, bounds.height).data);
+  uploadEditableLayerSource(layer);
+  schedulePaintLayerSerialization(layer);
+  recordPaintRegionHistoryAction(layer.id, {
+    x: bounds.x0,
+    y: bounds.y0,
+    width: bounds.width,
+    height: bounds.height,
+    canvasY: bounds.canvasY,
+  }, before, after);
+  refreshLayerThumbnail(layer);
+  renderLayers();
+  showToast(selected ? "Filled the selected area." : "Filled the layer.");
 }
 
 function mergeDirty(a, b) {
@@ -4179,6 +5094,7 @@ function drawPaintTransformBrush(layer, targetFramebuffer, sourceTexture, target
   gl.useProgram(gpu.paintTransformProgram);
   bindTexture(gpu.paintTransformProgram, "uSource", sourceTexture, 0);
   bindBrushTexture(gpu.paintTransformProgram, preset, 1);
+  bindManualSelection(gpu.paintTransformProgram, 2, layer);
   gl.uniform2f(gl.getUniformLocation(gpu.paintTransformProgram, "uResolution"), DOC_WIDTH, DOC_HEIGHT);
   gl.uniform2f(gl.getUniformLocation(gpu.paintTransformProgram, "uCenter"), transform.center.x, transform.center.y);
   gl.uniform2f(gl.getUniformLocation(gpu.paintTransformProgram, "uAxis"), geometry.axisX, geometry.axisY);
@@ -4208,6 +5124,7 @@ function drawMaskTransformBrush(targetFramebuffer, sourceTexture, targetWidth, t
   gl.useProgram(gpu.maskTransformProgram);
   bindTexture(gpu.maskTransformProgram, "uMaskSource", sourceTexture, 0);
   bindBrushTexture(gpu.maskTransformProgram, preset, 1);
+  bindManualSelection(gpu.maskTransformProgram, 2, getSelectedLayer());
   gl.uniform2f(gl.getUniformLocation(gpu.maskTransformProgram, "uResolution"), DOC_WIDTH, DOC_HEIGHT);
   gl.uniform2f(gl.getUniformLocation(gpu.maskTransformProgram, "uCenter"), transform.center.x, transform.center.y);
   gl.uniform2f(gl.getUniformLocation(gpu.maskTransformProgram, "uAxis"), geometry.axisX, geometry.axisY);
@@ -4407,7 +5324,9 @@ function beginStroke(event) {
   const layer = getSelectedLayer();
   if (layer) ensureLayerGpuTextures(layer);
   const mask = layer?.mask;
-  const paintContent = (layer?.kind === "paint" || layer?.kind === "height") && state.selectionPart === "content";
+  const paintContent = (
+    layer?.kind === "paint" || layer?.kind === "height"
+  ) && state.selectionPart === "content";
   if (event.button !== 0 || (!paintContent && (!mask || !mask.enabled || state.selectionPart !== "mask"))) return;
   event.preventDefault();
   canvas.setPointerCapture(event.pointerId);
@@ -4705,6 +5624,20 @@ function beginTouchGesture(event) {
   const metrics = touchGestureMetrics();
   if (!metrics) return;
   state.touchBrushAdjust = null;
+  if (state.manualInteraction) {
+    const pointerId = state.manualInteraction.pointerId;
+    if (canvas.hasPointerCapture(pointerId)) canvas.releasePointerCapture(pointerId);
+    if (state.manualInteraction.type === "marquee") {
+      const bounds = selectionBounds(state.manualSelection);
+      if (!bounds || bounds.width < 2 || bounds.height < 2 || state.manualSelection.points.length < 3) {
+        state.manualSelection = null;
+      } else {
+        state.manualSelection.closed = true;
+      }
+    }
+    state.manualInteraction = null;
+    drawManualEditingOverlay();
+  }
   if (state.paintPointerId !== null) {
     endStroke({
       pointerId: state.paintPointerId,
@@ -4851,6 +5784,23 @@ function handleCanvasPointerDown(event) {
     beginPan(event);
     return;
   }
+  if (state.activeTool === "transform" && isManualEditableLayer()) {
+    if (event.button !== 0) return;
+    if (!state.layerTransform) beginLayerTransform();
+    beginTransformInteraction(event);
+    return;
+  }
+  if (state.activeTool === "marquee" && isManualEditableLayer()) {
+    beginMarqueeInteraction(event);
+    return;
+  }
+  if (state.activeTool === "fill" && isManualEditableLayer()) {
+    if (event.button === 0) {
+      event.preventDefault();
+      fillEditableLayer();
+    }
+    return;
+  }
   beginStroke(event);
 }
 
@@ -4878,6 +5828,11 @@ function handleCanvasPointerMove(event) {
     continuePan(event);
     return;
   }
+  if (state.manualInteraction?.pointerId === event.pointerId) {
+    if (state.manualInteraction.type === "marquee") continueMarqueeInteraction(event);
+    else continueTransformInteraction(event);
+    return;
+  }
   continueStroke(event);
 }
 
@@ -4901,6 +5856,11 @@ function handleCanvasPointerEnd(event) {
     endPan(event);
     return;
   }
+  if (state.manualInteraction?.pointerId === event.pointerId) {
+    if (state.manualInteraction.type === "marquee") endMarqueeInteraction(event);
+    else endTransformInteraction(event);
+    return;
+  }
   endStroke(event);
 }
 
@@ -4912,11 +5872,16 @@ function handleCanvasWheel(event) {
 
 function syncCanvasCursor() {
   const layer = getSelectedLayer();
-  const painting = (state.selectionPart === "mask" && layer?.mask?.enabled)
-    || (state.selectionPart === "content" && (layer?.kind === "paint" || layer?.kind === "height"));
+  const painting = state.activeTool === "brush" && (
+    (state.selectionPart === "mask" && layer?.mask?.enabled)
+    || (state.selectionPart === "content" && (
+      layer?.kind === "paint" || layer?.kind === "height"
+    ))
+  );
   canvas.classList.toggle("is-mask-painting", Boolean(painting));
   canvas.classList.toggle("is-erasing", state.eraserPressed);
   if (!painting) brushCursor.style.opacity = "0";
+  syncManualToolUi();
 }
 
 function updateBrushCursor(event) {
@@ -5060,7 +6025,11 @@ function renderLayers() {
   layerList.innerHTML = displayLayers.map((layer) => {
     const selected = layer.id === state.selectedLayerId;
     const maskActive = selected && state.selectionPart === "mask";
-    const selectionPart = (layer.kind === "image" || layer.kind === "adjustment" || layer.kind === "material") && layer.mask ? "mask" : "content";
+    const selectionPart = (
+      layer.kind === "image"
+      || layer.kind === "adjustment"
+      || layer.kind === "material"
+    ) && layer.mask ? "mask" : "content";
     const maskAdjusted = layer.mask && (
       layer.mask.softness !== 0
       || layer.mask.opacity !== 1
@@ -5103,6 +6072,7 @@ function renderLayers() {
   syncHistoryButtons();
   syncMaskBadge();
   syncCanvasCursor();
+  drawManualEditingOverlay();
 }
 
 function syncAdjustmentTargetHighlight(adjustmentLayerId = null) {
@@ -5163,11 +6133,20 @@ function escapeHtml(value) {
 function selectLayer(layerId, part = "content") {
   const layer = state.layers.find((item) => item.id === layerId);
   if (!layer) return;
+  if (state.selectedLayerId !== layerId) {
+    if (state.layerTransform) commitLayerTransform();
+    state.manualSelection = null;
+    state.manualInteraction = null;
+    destroyManualSelectionTexture();
+  }
   state.selectedLayerId = layerId;
   if (state.maskSettingsLayerId && state.maskSettingsLayerId !== layerId) state.maskSettingsLayerId = null;
-  state.selectionPart = (layer.kind === "image" || layer.kind === "adjustment" || layer.kind === "material") && layer.mask
-    ? "mask"
-    : part === "mask" && layer.mask ? "mask" : "content";
+  state.selectionPart = state.activeTool !== "brush" && isManualEditableLayer(layer)
+    ? "content"
+    : (
+      (layer.kind === "image" || layer.kind === "adjustment" || layer.kind === "material")
+      && layer.mask
+    ) || (part === "mask" && layer.mask) ? "mask" : "content";
   if (layer.kind === "material") {
     ["colorMap", "normalMap", "roughnessMap", "metalnessMap"].forEach((key) => getMaterialMapTexture(layer, key));
   }
@@ -5281,6 +6260,8 @@ function showMaskMenu(row, layer, clientX, clientY) {
 }
 
 async function duplicateLayer(layer) {
+  if (state.layerTransform) commitLayerTransform();
+  flushDirtyPaintLayerDataUrls();
   const maskData = layer.mask?.data.slice();
   const copy = await createLayerFromImage(layer.sourceDataUrl, `${layer.name} copy`, {
     kind: layer.kind,
@@ -5410,6 +6391,7 @@ function deleteLayer(layer) {
     return;
   }
   const index = state.layers.indexOf(layer);
+  if (state.layerTransform?.layerId === layer.id) cancelLayerTransform();
   destroyLayerGpu(layer);
   state.layers.splice(index, 1);
   normalizeAdjustmentStarts();
@@ -5420,6 +6402,7 @@ function deleteLayer(layer) {
 }
 
 function handleLayerMenuAction(layer, action) {
+  if (state.layerTransform) commitLayerTransform();
   let documentChanged = false;
   if (action === "rename") {
     startLayerRename(layer.id);
@@ -6376,12 +7359,19 @@ function syncBrushUi() {
   document.querySelector("#brushPanel .panel-heading strong").textContent = preset.name;
   const selectedLayer = getSelectedLayer();
   const isPaintContent = selectedLayer?.kind === "paint" && state.selectionPart === "content";
+  const showsPaintColor = isPaintContent || (
+    state.activeTool === "fill"
+    && isManualEditableLayer(selectedLayer)
+    && state.selectionPart === "content"
+  );
   const isHeightContent = selectedLayer?.kind === "height" && state.selectionPart === "content";
   document.querySelector(".brush-value-row").hidden = isPaintContent;
-  paintColorPanel.hidden = !isPaintContent;
-  document.querySelector("#brushPanel .panel-heading .eyebrow").textContent = isHeightContent ? "Height brush" : "Mask brush";
+  paintColorPanel.hidden = !showsPaintColor;
+  document.querySelector("#brushPanel .panel-heading .eyebrow").textContent = isHeightContent
+    ? "Height brush"
+    : isPaintContent ? "Paint brush" : "Mask brush";
   if (!state.colorPickerFloating) resetPaintColorPanelPlacement();
-  if (isPaintContent) renderPaintColorPicker();
+  if (showsPaintColor) renderPaintColorPicker();
 }
 
 function resetPaintColorPanelPlacement() {
@@ -6492,12 +7482,14 @@ function setZoom(value) {
   document.getElementById("zoomRange").value = String(state.zoom);
   document.getElementById("zoomLabel").textContent = `${Math.round(state.zoom)}%`;
   canvasWrap.style.setProperty("--zoom-scale", state.zoom / 80);
+  drawManualEditingOverlay();
   scheduleViewportSave();
 }
 
 function syncViewport() {
   canvasWrap.style.setProperty("--pan-x", `${state.viewport.x}px`);
   canvasWrap.style.setProperty("--pan-y", `${state.viewport.y}px`);
+  drawManualEditingOverlay();
 }
 
 function isEditingTextField() {
@@ -7374,20 +8366,32 @@ function recordMaskTileHistoryAction(layerId, tiles, initializedBefore, initiali
   scheduleSave();
 }
 
-function recordPaintRegionHistoryAction(layerId, region, before, after) {
+function recordPaintRegionHistoryAction(layerId, region, before, after, selectionBefore, selectionAfter) {
   if (state.restoringHistory) return;
-  recordHistoryEntry(createHistoryActionMetadata({
+  const action = {
     kind: "paint-region",
     layerId,
     region,
     before,
     after,
-  }, before.byteLength + after.byteLength + 160));
+  };
+  if (arguments.length >= 6) {
+    action.selectionBefore = cloneHistoryValue(selectionBefore);
+    action.selectionAfter = cloneHistoryValue(selectionAfter);
+  }
+  recordHistoryEntry(createHistoryActionMetadata(
+    action,
+    before.byteLength + after.byteLength
+      + estimateHistoryValueBytes(selectionBefore)
+      + estimateHistoryValueBytes(selectionAfter)
+      + 160,
+  ));
   scheduleSave();
 }
 
 function commitDocumentAction() {
   if (state.restoringHistory) return;
+  if (state.layerTransform) commitLayerTransform();
   recordHistorySnapshot();
   scheduleSave();
 }
@@ -7402,6 +8406,13 @@ function resetDocumentHistory() {
 async function restoreHistorySnapshot(snapshot) {
   state.restoringHistory = true;
   try {
+    if (state.layerTransform) {
+      restoreTransformSource(state.layerTransform);
+      state.layerTransform = null;
+    }
+    state.manualSelection = null;
+    state.manualInteraction = null;
+    destroyManualSelectionTexture();
     state.layers.forEach(destroyLayerGpu);
     setDocumentDimensions(snapshot.width, snapshot.height);
     const restoredLayers = [];
@@ -7512,7 +8523,9 @@ function applyHistoryAction(action, direction) {
     requestRender();
     return true;
   }
-  if (action.kind === "paint-region" && (layer.kind === "paint" || layer.kind === "height")) {
+  if (action.kind === "paint-region" && (
+    layer.kind === "image" || layer.kind === "paint" || layer.kind === "height"
+  )) {
     ensureLayerGpuTextures(layer);
     ensurePaintLayerGpu(layer);
     const context = layer.sourceCanvas.getContext("2d", { alpha: true });
@@ -7543,6 +8556,12 @@ function applyHistoryAction(action, direction) {
       );
     });
     layer.sourceRevision = (layer.sourceRevision || 0) + 1;
+    if (Object.prototype.hasOwnProperty.call(action, "selectionBefore")) {
+      state.manualSelection = cloneHistoryValue(
+        direction === "undo" ? action.selectionBefore : action.selectionAfter,
+      );
+      drawManualEditingOverlay();
+    }
     schedulePaintLayerSerialization(layer);
     invalidateLayerThumbnail(layer);
     refreshLayerThumbnail(layer);
@@ -7554,6 +8573,10 @@ function applyHistoryAction(action, direction) {
 }
 
 async function undoDocument() {
+  if (state.layerTransform) {
+    cancelLayerTransform();
+    return;
+  }
   if (state.historyIndex <= 0) return;
   const current = state.history[state.historyIndex];
   state.historyIndex -= 1;
@@ -7567,6 +8590,10 @@ async function undoDocument() {
 }
 
 async function redoDocument() {
+  if (state.layerTransform) {
+    cancelLayerTransform();
+    return;
+  }
   if (state.historyIndex < 0 || state.historyIndex >= state.history.length - 1) return;
   state.historyIndex += 1;
   const next = state.history[state.historyIndex];
@@ -7714,6 +8741,7 @@ function requestDesktopAutosave() {
 }
 
 function flushDocumentAutosave() {
+  if (state.layerTransform) commitLayerTransform();
   window.clearTimeout(state.saveTimer);
   window.clearTimeout(state.viewportSaveTimer);
   state.saveTimer = 0;
@@ -7902,6 +8930,7 @@ function downloadProjectFile(contents) {
 }
 
 async function saveProject(saveAs = false) {
+  if (state.layerTransform) commitLayerTransform();
   flushDirtyPaintLayerDataUrls();
   const contents = JSON.stringify(projectPayload(), null, 2);
   const desktop = window.shaderPaintDesktop;
@@ -7940,6 +8969,9 @@ async function saveProject(saveAs = false) {
 }
 
 async function applyStoredDocument(stored) {
+  if (state.layerTransform) cancelLayerTransform();
+  state.manualSelection = null;
+  state.manualInteraction = null;
   if (!stored?.layers?.length) return false;
   setDocumentDimensions(stored.width || 1200, stored.height || 900);
   const restoredLayers = [];
@@ -8131,6 +9163,7 @@ async function createNewDocument() {
 }
 
 function exportPng() {
+  if (state.layerTransform) commitLayerTransform();
   renderDocument({ width: DOC_WIDTH, height: DOC_HEIGHT });
   const link = document.createElement("a");
   link.download = `shader-paint-${new Date().toISOString().slice(0, 10)}.png`;
@@ -8160,6 +9193,7 @@ function compositeNormalLayer(baseTexture, layerTexture, layer, target, boundMas
   bindTexture(gpu.compositeProgram, "uBoundMask", boundMaskTexture || gpu.whiteMask, 4);
   gl.uniform1f(gl.getUniformLocation(gpu.compositeProgram, "uOpacity"), layer.opacity);
   gl.uniform1i(gl.getUniformLocation(gpu.compositeProgram, "uMode"), BLEND_MODE_CODES[layer.blendMode] ?? 0);
+  gl.uniform1i(gl.getUniformLocation(gpu.compositeProgram, "uAdjustment"), layer.kind === "adjustment" ? 1 : 0);
   gl.uniform1i(gl.getUniformLocation(gpu.compositeProgram, "uUseMask"), layer.mask ? 1 : 0);
   gl.uniform1i(gl.getUniformLocation(gpu.compositeProgram, "uUseBoundMask"), boundMaskTexture ? 1 : 0);
   gl.uniform1i(gl.getUniformLocation(gpu.compositeProgram, "uMaskEnabled"), layer.mask?.enabled ? 1 : 0);
@@ -8296,6 +9330,21 @@ function reportError(error) {
 
 function registerOfflineSupport() {
   if (!("serviceWorker" in navigator)) return;
+  if (import.meta.env?.DEV) {
+    void navigator.serviceWorker.getRegistrations().then((registrations) => Promise.all(
+      registrations
+        .filter((registration) => registration.scope.startsWith(window.location.origin))
+        .map((registration) => registration.unregister()),
+    ));
+    if ("caches" in window) {
+      void caches.keys().then((names) => Promise.all(
+        names
+          .filter((name) => name.startsWith("shader-paint-offline-"))
+          .map((name) => caches.delete(name)),
+      ));
+    }
+    return;
+  }
   navigator.serviceWorker.register("./service-worker.js", { scope: "./" })
     .then(() => navigator.serviceWorker.ready)
     .then((registration) => {
@@ -8351,6 +9400,21 @@ function wireEvents() {
     });
   }
   document.getElementById("webSettingsButton").addEventListener("click", () => setSettingsOpen(settingsPanel.hidden));
+
+  manualTools.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-manual-tool]");
+    if (!button || button.disabled) return;
+    setActiveManualTool(button.dataset.manualTool);
+  });
+  manualToolOptions.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-marquee-mode]");
+    if (!button) return;
+    if (state.manualSelection?.closed === false) state.manualSelection = null;
+    state.marqueeMode = button.dataset.marqueeMode;
+    state.manualInteraction = null;
+    syncManualToolUi();
+    drawManualEditingOverlay();
+  });
 
   canvas.addEventListener("pointerdown", handleCanvasPointerDown);
   canvas.addEventListener("pointermove", handleCanvasPointerMove);
@@ -8408,6 +9472,7 @@ function wireEvents() {
   window.addEventListener("resize", () => {
     syncCanvasPresentation();
     requestRender();
+    drawManualEditingOverlay();
   });
 
   setPairedControl(brushSize, brushSizeNumber, state.brush.size, (value) => {
@@ -8794,6 +9859,7 @@ function wireEvents() {
       renderLayers();
       renderFilters();
     } else if (action === "visibility") {
+      if (state.layerTransform?.layerId === layer.id) commitLayerTransform();
       layer.visible = !layer.visible;
       if (!layer.visible) releaseHiddenLayerTextures(layer);
       renderLayers();
@@ -9018,6 +10084,7 @@ function wireEvents() {
       });
       const layer = await createLayerFromImage(dataUrl, file.name.replace(/\.[^.]+$/, ""), { nativeDimensions: isNewDocument });
       if (isNewDocument) {
+        if (state.layerTransform) cancelLayerTransform();
         state.layers.forEach(destroyLayerGpu);
         state.layers = [layer];
         state.documentName = normalizeProjectName(file.name.replace(/\.[^.]+$/, ""));
@@ -9782,6 +10849,76 @@ function wireEvents() {
       return;
     }
     if (isEditingTextField()) return;
+    if (modifier && event.code === "KeyT") {
+      consumeCanvasShortcut(event);
+      if (!event.repeat) setActiveManualTool("transform");
+      return;
+    }
+    if (!modifier && !event.altKey && event.code === "KeyB") {
+      consumeCanvasShortcut(event);
+      if (!event.repeat) setActiveManualTool("brush");
+      return;
+    }
+    if (!modifier && !event.altKey && event.code === "KeyV") {
+      consumeCanvasShortcut(event);
+      if (!event.repeat) setActiveManualTool("transform");
+      return;
+    }
+    if (!modifier && !event.altKey && event.code === "KeyM") {
+      consumeCanvasShortcut(event);
+      if (!event.repeat) {
+        if (event.shiftKey && state.activeTool === "marquee") {
+          const modes = ["rectangle", "lasso", "polygon"];
+          state.marqueeMode = modes[(modes.indexOf(state.marqueeMode) + 1) % modes.length];
+        }
+        setActiveManualTool("marquee");
+      }
+      return;
+    }
+    if (!modifier && !event.altKey && event.code === "KeyG") {
+      consumeCanvasShortcut(event);
+      if (!event.repeat) setActiveManualTool("fill");
+      return;
+    }
+    if (event.key === "Enter") {
+      if (state.layerTransform) {
+        consumeCanvasShortcut(event);
+        commitLayerTransform();
+        return;
+      }
+      if (state.manualSelection?.type === "polygon" && state.manualSelection.closed === false) {
+        consumeCanvasShortcut(event);
+        finishPolygonSelection();
+        return;
+      }
+    }
+    if (event.key === "Escape") {
+      if (state.layerTransform) {
+        consumeCanvasShortcut(event);
+        cancelLayerTransform();
+        return;
+      }
+      if (state.manualSelection) {
+        consumeCanvasShortcut(event);
+        clearManualSelection();
+        return;
+      }
+    }
+    if (state.layerTransform && ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) {
+      consumeCanvasShortcut(event);
+      const distance = event.shiftKey ? 10 : 1;
+      const delta = {
+        x: event.key === "ArrowLeft" ? -distance : event.key === "ArrowRight" ? distance : 0,
+        y: event.key === "ArrowDown" ? -distance : event.key === "ArrowUp" ? distance : 0,
+      };
+      state.layerTransform.corners = state.layerTransform.corners.map((corner) => ({
+        x: corner.x + delta.x,
+        y: corner.y + delta.y,
+      }));
+      updateLayerTransformPreview();
+      drawManualEditingOverlay();
+      return;
+    }
     if (event.code === "Space" && plainShortcut) {
       consumeCanvasShortcut(event);
       heldCanvasShortcutCodes.add(event.code);
@@ -9826,7 +10963,11 @@ function wireEvents() {
       heldCanvasShortcutCodes.add(event.code);
       if (!event.repeat) {
         state.dPicker = { downAt: performance.now(), wasOpen: state.colorPickerFloating };
-        if (!state.colorPickerFloating && getSelectedLayer()?.kind === "paint") {
+        if (
+          !state.colorPickerFloating
+          && isManualEditableLayer()
+          && state.selectionPart === "content"
+        ) {
           state.colorPickerFloating = true;
           document.body.append(paintColorPanel);
           paintColorPanel.hidden = false;
