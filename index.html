@@ -75,7 +75,7 @@
             <button type="button" data-manual-tool="brush" class="active" title="Brush tool (B)" aria-label="Brush tool (B)" aria-pressed="true">
               <svg viewBox="0 0 20 20"><path d="m5 14 8.8-8.8 1.9 1.9L7 15.8 4 17zM12.7 6.3l1-1 2 2-1 1"/><path d="M4 17c1.7.2 3-.2 3.8-1.2"/></svg>
             </button>
-            <button type="button" data-manual-tool="transform" title="Select and transform (V, Ctrl+T)" aria-label="Select and transform (V, Ctrl+T)" aria-pressed="false">
+            <button type="button" data-manual-tool="transform" title="Select and transform (T, V, Ctrl+T)" aria-label="Select and transform (T, V, Ctrl+T)" aria-pressed="false">
               <svg viewBox="0 0 20 20"><path d="m5 2.8 9.4 8.6-5 .7-2.3 4.5z"/></svg>
             </button>
             <button type="button" data-manual-tool="marquee" title="Marquee tool (M)" aria-label="Marquee tool (M)" aria-pressed="false">
@@ -191,7 +191,6 @@
 
           <div class="canvas-wrap" id="canvasWrap">
             <canvas id="paintCanvas" tabindex="0"></canvas>
-            <canvas class="selection-overlay" id="selectionOverlay" aria-hidden="true"></canvas>
             <div class="canvas-empty" id="canvasEmpty">
               <strong>Preparing canvas</strong>
               <span>Loading the local starter image...</span>
@@ -203,6 +202,8 @@
             <div class="brush-cursor" id="brushCursor"></div>
             <div class="eyedropper-indicator" id="eyedropperIndicator" hidden><i></i><span></span></div>
           </div>
+
+          <canvas class="selection-overlay" id="selectionOverlay" aria-hidden="true"></canvas>
 
           <div class="zoom-bar glass-panel">
             <button id="fitButton">Fit</button>
@@ -445,9 +446,9 @@
           <div><dt>Save / Save as</dt><dd>Ctrl+S / Ctrl+Shift+S</dd></div>
           <div><dt>Open / New</dt><dd>Ctrl+O / Ctrl+N</dd></div>
           <div><dt>Pan canvas</dt><dd>Space + drag</dd></div>
-          <div><dt>Brush / Transform</dt><dd>B / V or Ctrl+T</dd></div>
+          <div><dt>Brush / Transform</dt><dd>B / T, V or Ctrl+T</dd></div>
           <div><dt>Marquee / Fill</dt><dd>M / G</dd></div>
-          <div><dt>Apply / Cancel transform</dt><dd>Enter / Esc</dd></div>
+          <div><dt>Apply transform &amp; return to Brush / Cancel</dt><dd>Enter / Esc</dd></div>
           <div><dt>Brush size</dt><dd>Hold S + drag</dd></div>
           <div><dt>Temporary eraser</dt><dd>Hold E</dd></div>
         </dl>

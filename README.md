@@ -71,14 +71,34 @@ hot-reload module responses cannot be reused as production CSS or JavaScript.
 Base image and Paint layers support a Photoshop-style tool strip in the upper
 left of the canvas:
 
+- Drag image files anywhere into the app to add them above the selected layer,
+  using the same flow as Import image. Multiple images import in order without
+  resizing or replacing the current document. Invalid files show an error;
+  internal layer/filter drag-to-reorder is unaffected.
 - Brush (`B`) paints color directly only on Paint layers. On Base image layers,
   it keeps the existing mask-painting workflow. A completed marquee clips
   normal, stamp, and directional brush strokes.
-- Select/Transform (`V` or `Ctrl+T`) transforms the whole layer or the current
-  marquee. Drag corners with the aspect ratio locked, hold `Shift` for free
+- Select/Transform (`T`, `V` or `Ctrl+T`) frames the layer's nontransparent
+  content (not empty canvas margins), or transforms the current marquee.
+  Drag corners with the aspect ratio locked, hold `Shift` for free
   scaling, hold `Ctrl`/`Cmd` to pull one corner, and drag outside to rotate.
   `Shift` snaps rotation to 5-degree increments. Leaving Transform clears its
-  selection outline.
+  selection outline. `Enter` applies the transform and returns to Brush only
+  while Transform is active; polygon marquee `Enter` still closes its polygon.
+  Transform handles remain visible and draggable outside the canvas, within
+  the workspace. Zoom out or pan to reach handles beyond the workspace.
+  Pixels moved outside the canvas are retained across further transforms,
+  undo/redo, layer copies, project saves and recovery; preview and PNG export
+  still use the document's original bounds. Off-canvas storage is allocated
+  only when needed and released when all content returns inside the canvas.
+  Excessively large transforms are rejected with a message to avoid unsafe
+  image allocations.
+  Undo (`Q` or `Ctrl`/`Cmd+Z`) and redo (`W` or `Ctrl`/`Cmd+Shift+Z`) include
+  the current transform even before `Enter`: undo records and reverts it,
+  so redo can restore it, including off-canvas pixels. A new transform after
+  undo starts a new history branch; `Escape` remains an explicit cancellation.
+- Run `npm test` for content-bound, off-canvas geometry and overlay-coordinate
+  regression checks (Node.js built-in test runner; no extra dependencies).
 - Marquee (`M`) includes rectangular, freehand lasso, and point-by-point
   polygonal selection.
 - Fill (`G`) fills the whole layer or current marquee with the active paint

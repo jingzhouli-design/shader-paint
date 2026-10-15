@@ -2150,7 +2150,7 @@ function readFileAsDataUrl(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => resolve(reader.result);
-    reader.onerror = () => reject(reader.error || new Error("Could not read material map."));
+    reader.onerror = () => reject(reader.error || new Error("The selected file could not be read."));
     reader.readAsDataURL(file);
   });
 }
@@ -3268,6 +3268,7 @@ function createLayerFromSourceCanvas(sourceCanvas, name, options = {}) {
     adjustmentStartLayerId: options.adjustmentStartLayerId ?? null,
     sourceDataUrl: options.sourceDataUrl || sourceCanvas.toDataURL("image/png"),
     sourceCanvas,
+    offCanvasSource: null,
     sourceTexture: textureFromCanvas(sourceCanvas),
     sourceRevision: 0,
     thumbnail: options.thumbnail || sourceCanvas.toDataURL("image/png"),
@@ -3299,11 +3300,26 @@ async function createLayerFromImage(url, name, options = {}) {
   const image = await loadImage(url);
   if (options.nativeDimensions) setDocumentDimensions(image.naturalWidth, image.naturalHeight);
   const sourceCanvas = makeSourceCanvas(image);
-  return createLayerFromSourceCanvas(sourceCanvas, name, {
+  let offCanvasSource = null;
+  if (options.offCanvasSource) {
+    const stored = options.offCanvasSource;
+    if (!Number.isSafeInteger(stored.x) || !Number.isSafeInteger(stored.canvasY) || typeof stored.dataUrl !== "string") {
+      throw new Error(`Invalid off-canvas image data for layer "${name}".`);
+    }
+    const overflowImage = await loadImage(stored.dataUrl);
+    const overflowCanvas = document.createElement("canvas");
+    overflowCanvas.width = overflowImage.naturalWidth;
+    overflowCanvas.height = overflowImage.naturalHeight;
+    overflowCanvas.getContext("2d").drawImage(overflowImage, 0, 0);
+    offCanvasSource = { x: stored.x, canvasY: stored.canvasY, canvas: overflowCanvas, dataUrl: stored.dataUrl };
+  }
+  const layer = createLayerFromSourceCanvas(sourceCanvas, name, {
     ...options,
     kind: options.kind || "image",
     sourceDataUrl: options.sourceDataUrl || canvasToPortableDataUrl(sourceCanvas),
   });
+  layer.offCanvasSource = offCanvasSource;
+  return layer;
 }
 
 function destroyLayerGpu(layer) {
@@ -3501,7 +3517,7 @@ function syncMaskTilesFromGpu(mask, tiles) {
 }
 
 function syncHistoryButtons() {
-  document.getElementById("undoButton").disabled = state.historyIndex <= 0;
+  document.getElementById("undoButton").disabled = state.historyIndex <= 0 && !hasLayerTransformChanges();
   document.getElementById("redoButton").disabled = state.historyIndex < 0 || state.historyIndex >= state.history.length - 1;
 }
 
@@ -3525,7 +3541,7 @@ function clampDocumentPoint(point) {
   };
 }
 
-function selectionBounds(selection) {
+function selectionBounds(selection, clipToDocument = true) {
   if (!selection?.points?.length) return null;
   const extents = selection.points.reduce((result, point) => ({
     minX: Math.min(result.minX, point.x),
@@ -3533,10 +3549,10 @@ function selectionBounds(selection) {
     maxX: Math.max(result.maxX, point.x),
     maxY: Math.max(result.maxY, point.y),
   }), { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity });
-  const x0 = Math.max(0, Math.floor(extents.minX));
-  const y0 = Math.max(0, Math.floor(extents.minY));
-  const x1 = Math.min(DOC_WIDTH, Math.ceil(extents.maxX));
-  const y1 = Math.min(DOC_HEIGHT, Math.ceil(extents.maxY));
+  const x0 = clipToDocument ? Math.max(0, Math.floor(extents.minX)) : Math.floor(extents.minX);
+  const y0 = clipToDocument ? Math.max(0, Math.floor(extents.minY)) : Math.floor(extents.minY);
+  const x1 = clipToDocument ? Math.min(DOC_WIDTH, Math.ceil(extents.maxX)) : Math.ceil(extents.maxX);
+  const y1 = clipToDocument ? Math.min(DOC_HEIGHT, Math.ceil(extents.maxY)) : Math.ceil(extents.maxY);
   if (x1 <= x0 || y1 <= y0) return null;
   return {
     x0,
@@ -3691,11 +3707,11 @@ function setActiveManualTool(tool) {
 }
 
 function overlayPoint(point) {
-  const width = canvas.clientWidth;
-  const height = canvas.clientHeight;
+  const rect = canvas.getBoundingClientRect();
+  const stage = canvasStage.getBoundingClientRect();
   return {
-    x: point.x / DOC_WIDTH * width,
-    y: (1 - point.y / DOC_HEIGHT) * height,
+    x: rect.left - stage.left + point.x / DOC_WIDTH * rect.width,
+    y: rect.top - stage.top + (1 - point.y / DOC_HEIGHT) * rect.height,
   };
 }
 
@@ -3822,18 +3838,12 @@ function transformRotationHandle(transform) {
     { x: 0, y: 0 },
   );
   const length = Math.hypot(top.x - center.x, top.y - center.y) || 1;
-  const documentOffset = 26 / Math.max(1, canvas.clientHeight) * DOC_HEIGHT;
+  const documentOffset = 26 / Math.max(1, canvas.getBoundingClientRect().height) * DOC_HEIGHT;
   const direction = { x: (top.x - center.x) / length, y: (top.y - center.y) / length };
-  let handle = {
+  const handle = {
     x: top.x + direction.x * documentOffset,
     y: top.y + direction.y * documentOffset,
   };
-  if (handle.x < 0 || handle.x > DOC_WIDTH || handle.y < 0 || handle.y > DOC_HEIGHT) {
-    handle = {
-      x: top.x - direction.x * documentOffset,
-      y: top.y - direction.y * documentOffset,
-    };
-  }
   return { anchor: top, handle };
 }
 
@@ -3859,8 +3869,8 @@ function drawSelectionOutline(context, points, incomplete = false) {
 }
 
 function drawManualEditingOverlay() {
-  const cssWidth = canvas.clientWidth;
-  const cssHeight = canvas.clientHeight;
+  const cssWidth = canvasStage.clientWidth;
+  const cssHeight = canvasStage.clientHeight;
   if (!cssWidth || !cssHeight) {
     selectionOverlay.width = 1;
     selectionOverlay.height = 1;
@@ -3921,44 +3931,67 @@ function uploadEditableLayerSource(layer) {
   requestRender();
 }
 
-function layerContentBounds(layer) {
-  if (layer.kind === "image") {
-    return { x0: 0, y0: 0, x1: DOC_WIDTH, y1: DOC_HEIGHT, width: DOC_WIDTH, height: DOC_HEIGHT, canvasY: 0 };
-  }
-  if (layer.contentBoundsRevision === layer.sourceRevision && layer.contentBounds) {
-    return { ...layer.contentBounds };
-  }
-  const context = layer.sourceCanvas.getContext("2d", { alpha: true, willReadFrequently: true });
-  const pixels = context.getImageData(0, 0, DOC_WIDTH, DOC_HEIGHT).data;
-  let minX = DOC_WIDTH;
-  let minY = DOC_HEIGHT;
+function serializeOffCanvasSource(source) {
+  return source ? { x: source.x, canvasY: source.canvasY, dataUrl: source.dataUrl } : null;
+}
+
+function completeEditableLayerSource(layer) {
+  const overflow = layer.offCanvasSource;
+  const x = Math.min(0, overflow?.x ?? 0);
+  const canvasY = Math.min(0, overflow?.canvasY ?? 0);
+  const right = Math.max(DOC_WIDTH, overflow ? overflow.x + overflow.canvas.width : 0);
+  const bottom = Math.max(DOC_HEIGHT, overflow ? overflow.canvasY + overflow.canvas.height : 0);
+  const source = document.createElement("canvas");
+  source.width = right - x;
+  source.height = bottom - canvasY;
+  const context = source.getContext("2d", { alpha: true, willReadFrequently: true });
+  if (overflow) context.drawImage(overflow.canvas, overflow.x - x, overflow.canvasY - canvasY);
+  context.drawImage(layer.sourceCanvas, -x, -canvasY);
+  return { canvas: source, x, canvasY };
+}
+
+function sourceContentBounds(source) {
+  const { canvas: sourceCanvas, x: offsetX, canvasY: offsetY } = source;
+  const width = sourceCanvas.width;
+  const height = sourceCanvas.height;
+  const context = sourceCanvas.getContext("2d", { alpha: true, willReadFrequently: true });
+  const pixels = context.getImageData(0, 0, width, height).data;
+  let minX = width;
+  let minY = height;
   let maxX = -1;
   let maxY = -1;
-  for (let y = 0; y < DOC_HEIGHT; y += 1) {
-    for (let x = 0; x < DOC_WIDTH; x += 1) {
-      if (pixels[(y * DOC_WIDTH + x) * 4 + 3] === 0) continue;
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      if (pixels[(y * width + x) * 4 + 3] === 0) continue;
       minX = Math.min(minX, x);
       minY = Math.min(minY, y);
       maxX = Math.max(maxX, x);
       maxY = Math.max(maxY, y);
     }
   }
-  if (maxX < minX || maxY < minY) {
-    layer.contentBounds = { x0: 0, y0: 0, x1: DOC_WIDTH, y1: DOC_HEIGHT, width: DOC_WIDTH, height: DOC_HEIGHT, canvasY: 0 };
-    layer.contentBoundsRevision = layer.sourceRevision;
-    return { ...layer.contentBounds };
-  }
-  layer.contentBounds = {
-    x0: minX,
-    y0: DOC_HEIGHT - maxY - 1,
-    x1: maxX + 1,
-    y1: DOC_HEIGHT - minY,
+  if (maxX < minX || maxY < minY) return null;
+  return {
+    x0: offsetX + minX,
+    y0: DOC_HEIGHT - offsetY - maxY - 1,
+    x1: offsetX + maxX + 1,
+    y1: DOC_HEIGHT - offsetY - minY,
     width: maxX - minX + 1,
     height: maxY - minY + 1,
-    canvasY: minY,
+    canvasY: offsetY + minY,
   };
+}
+
+function layerContentBounds(layer, source) {
+  if (layer.contentBoundsRevision === layer.sourceRevision) {
+    return layer.contentBounds ? { ...layer.contentBounds } : null;
+  }
+  layer.contentBounds = sourceContentBounds(source || (
+    layer.offCanvasSource
+      ? completeEditableLayerSource(layer)
+      : { canvas: layer.sourceCanvas, x: 0, canvasY: 0 }
+  ));
   layer.contentBoundsRevision = layer.sourceRevision;
-  return { ...layer.contentBounds };
+  return layer.contentBounds ? { ...layer.contentBounds } : null;
 }
 
 function selectionFromBounds(layerId, bounds) {
@@ -3975,34 +4008,33 @@ function beginLayerTransform() {
   const layer = getSelectedLayer();
   if (!isManualEditableLayer(layer)) return;
   flushPendingPaintDabs();
+  const source = completeEditableLayerSource(layer);
   const selected = activeManualSelection(layer);
-  const bounds = selected ? selectionBounds(selected) : layerContentBounds(layer);
+  const bounds = selected ? selectionBounds(selected, false) : layerContentBounds(layer, source);
   if (!bounds) {
     showToast("There is no selected content to transform.");
     return;
   }
   const effectiveSelection = selected || selectionFromBounds(layer.id, bounds);
-  const sourceContext = layer.sourceCanvas.getContext("2d", { alpha: true, willReadFrequently: true });
-  const sourceBefore = sourceContext.getImageData(bounds.x0, bounds.canvasY, bounds.width, bounds.height);
   const contentCanvas = document.createElement("canvas");
   contentCanvas.width = bounds.width;
   contentCanvas.height = bounds.height;
   const contentContext = contentCanvas.getContext("2d", { alpha: true });
   contentContext.save();
   contentContext.clip(selectionPath(effectiveSelection, bounds.x0, bounds.canvasY));
-  contentContext.drawImage(layer.sourceCanvas, -bounds.x0, -bounds.canvasY);
+  contentContext.drawImage(source.canvas, source.x - bounds.x0, source.canvasY - bounds.canvasY);
   contentContext.restore();
+  const sourceContext = source.canvas.getContext("2d");
   sourceContext.save();
+  sourceContext.translate(-source.x, -source.canvasY);
   sourceContext.globalCompositeOperation = "destination-out";
   sourceContext.fill(selectionPath(effectiveSelection));
   sourceContext.restore();
-  uploadEditableLayerSource(layer);
   state.layerTransform = {
     layerId: layer.id,
     bounds,
     originalSelection: selected ? cloneHistoryValue(selected) : null,
-    sourceWasDirty: layer.sourceDataUrlDirty === true,
-    sourceBefore,
+    background: source,
     contentCanvas,
     outline: effectiveSelection.points.map((point) => ({ ...point })),
     corners: [
@@ -4012,6 +4044,7 @@ function beginLayerTransform() {
       { x: bounds.x0, y: bounds.y0 },
     ],
   };
+  state.layerTransform.lastValidCorners = state.layerTransform.corners.map((point) => ({ ...point }));
   updateLayerTransformPreview();
   drawManualEditingOverlay();
 }
@@ -4020,6 +4053,14 @@ function updateLayerTransformPreview() {
   const transform = state.layerTransform;
   const layer = state.layers.find((item) => item.id === transform?.layerId);
   if (!transform || !layer) return;
+  const extent = transformSourceExtent(transform);
+  if (extent.width > 32767 || extent.height > 32767 || extent.width * extent.height > MAX_HISTORY_BYTES / 4) {
+    transform.corners = transform.lastValidCorners.map((point) => ({ ...point }));
+    showToast("This transform is too large to retain safely. Try a smaller size or move.");
+  } else {
+    transform.lastValidCorners = transform.corners.map((point) => ({ ...point }));
+  }
+  syncHistoryButtons();
   if (!transform.previewCanvas) {
     transform.previewCanvas = document.createElement("canvas");
     transform.previewCanvas.width = DOC_WIDTH;
@@ -4027,7 +4068,7 @@ function updateLayerTransformPreview() {
   }
   const context = transform.previewCanvas.getContext("2d", { alpha: true });
   context.clearRect(0, 0, DOC_WIDTH, DOC_HEIGHT);
-  context.drawImage(layer.sourceCanvas, 0, 0);
+  context.drawImage(transform.background.canvas, transform.background.x, transform.background.canvasY);
   const canvasCorners = transform.corners.map((point) => ({ x: point.x, y: DOC_HEIGHT - point.y }));
   drawQuadImage(context, transform.contentCanvas, canvasCorners);
   if (!transform.previewTexture) {
@@ -4049,23 +4090,15 @@ function releaseLayerTransformPreview(transform) {
   }
 }
 
-function restoreTransformSource(transform) {
-  const layer = state.layers.find((item) => item.id === transform.layerId);
-  if (!layer) return;
-  const context = layer.sourceCanvas.getContext("2d", { alpha: true });
-  context.putImageData(transform.sourceBefore, transform.bounds.x0, transform.bounds.canvasY);
-  uploadEditableLayerSource(layer);
-  if (transform.sourceWasDirty) schedulePaintLayerSerialization(layer);
-}
-
 function cancelLayerTransform() {
   const transform = state.layerTransform;
   if (!transform) return;
   releaseManualPointerCapture();
-  restoreTransformSource(transform);
   releaseLayerTransformPreview(transform);
   state.layerTransform = null;
   state.manualInteraction = null;
+  syncHistoryButtons();
+  requestRender();
   drawManualEditingOverlay();
 }
 
@@ -4078,18 +4111,37 @@ function releaseManualPointerCapture() {
 function unionTransformBounds(transform) {
   const xs = [transform.bounds.x0, transform.bounds.x1, ...transform.corners.map((point) => point.x)];
   const ys = [transform.bounds.y0, transform.bounds.y1, ...transform.corners.map((point) => point.y)];
-  const x0 = Math.max(0, Math.floor(Math.min(...xs)));
-  const y0 = Math.max(0, Math.floor(Math.min(...ys)));
-  const x1 = Math.min(DOC_WIDTH, Math.ceil(Math.max(...xs)));
-  const y1 = Math.min(DOC_HEIGHT, Math.ceil(Math.max(...ys)));
+  const x0 = Math.max(0, Math.min(DOC_WIDTH, Math.floor(Math.min(...xs))));
+  const y0 = Math.max(0, Math.min(DOC_HEIGHT, Math.floor(Math.min(...ys))));
+  const x1 = Math.max(0, Math.min(DOC_WIDTH, Math.ceil(Math.max(...xs))));
+  const y1 = Math.max(0, Math.min(DOC_HEIGHT, Math.ceil(Math.max(...ys))));
   return { x0, y0, x1, y1, width: x1 - x0, height: y1 - y0, canvasY: DOC_HEIGHT - y1 };
 }
 
-function commitLayerTransform() {
-  const transform = state.layerTransform;
-  const layer = state.layers.find((item) => item.id === transform?.layerId);
-  if (!transform || !layer) return;
-  const unchanged = transform.corners.every((corner, index) => (
+function transformSourceExtent(transform) {
+  const background = transform.background;
+  const x = Math.floor(Math.min(background.x, ...transform.corners.map((point) => point.x)));
+  const canvasY = Math.floor(Math.min(background.canvasY, ...transform.corners.map((point) => DOC_HEIGHT - point.y)));
+  const right = Math.ceil(Math.max(background.x + background.canvas.width, ...transform.corners.map((point) => point.x)));
+  const bottom = Math.ceil(Math.max(background.canvasY + background.canvas.height, ...transform.corners.map((point) => DOC_HEIGHT - point.y)));
+  return { x, canvasY, width: right - x, height: bottom - canvasY };
+}
+
+function retainOffCanvasSource(source) {
+  const bounds = sourceContentBounds(source);
+  if (!bounds || (bounds.x0 >= 0 && bounds.y0 >= 0 && bounds.x1 <= DOC_WIDTH && bounds.y1 <= DOC_HEIGHT)) return null;
+  const overflow = document.createElement("canvas");
+  overflow.width = bounds.width;
+  overflow.height = bounds.height;
+  const context = overflow.getContext("2d", { alpha: true, willReadFrequently: true });
+  context.drawImage(source.canvas, source.x - bounds.x0, source.canvasY - bounds.canvasY);
+  // Visible pixels remain authoritative in sourceCanvas, including subsequent brush edits.
+  context.clearRect(-bounds.x0, -bounds.canvasY, DOC_WIDTH, DOC_HEIGHT);
+  return { x: bounds.x0, canvasY: bounds.canvasY, canvas: overflow, dataUrl: canvasToPortableDataUrl(overflow) };
+}
+
+function hasLayerTransformChanges(transform = state.layerTransform) {
+  return Boolean(transform && !transform.corners.every((corner, index) => (
     corner.x === [
       transform.bounds.x0,
       transform.bounds.x1,
@@ -4102,37 +4154,45 @@ function commitLayerTransform() {
       transform.bounds.y0,
       transform.bounds.y0,
     ][index]
-  ));
-  if (unchanged) {
+  )));
+}
+
+function commitLayerTransform() {
+  const transform = state.layerTransform;
+  const layer = state.layers.find((item) => item.id === transform?.layerId);
+  if (!transform || !layer) return;
+  if (!hasLayerTransformChanges(transform)) {
     cancelLayerTransform();
     return;
   }
   const region = unionTransformBounds(transform);
   const context = layer.sourceCanvas.getContext("2d", { alpha: true, willReadFrequently: true });
-  const beforeCanvas = document.createElement("canvas");
-  beforeCanvas.width = region.width;
-  beforeCanvas.height = region.height;
-  const beforeContext = beforeCanvas.getContext("2d", { alpha: true });
-  beforeContext.putImageData(
-    context.getImageData(region.x0, region.canvasY, region.width, region.height),
-    0,
-    0,
-  );
-  beforeContext.putImageData(
-    transform.sourceBefore,
-    transform.bounds.x0 - region.x0,
-    transform.bounds.canvasY - region.canvasY,
-  );
-  const before = new Uint8Array(beforeContext.getImageData(0, 0, region.width, region.height).data);
-  const canvasCorners = transform.corners.map((point) => ({ x: point.x, y: DOC_HEIGHT - point.y }));
-  drawQuadImage(context, transform.contentCanvas, canvasCorners);
-  const after = new Uint8Array(context.getImageData(region.x0, region.canvasY, region.width, region.height).data);
+  const before = region.width && region.height
+    ? new Uint8Array(context.getImageData(region.x0, region.canvasY, region.width, region.height).data)
+    : new Uint8Array();
+  const extent = transformSourceExtent(transform);
+  const result = document.createElement("canvas");
+  result.width = extent.width;
+  result.height = extent.height;
+  const resultContext = result.getContext("2d", { alpha: true, willReadFrequently: true });
+  resultContext.drawImage(transform.background.canvas, transform.background.x - extent.x, transform.background.canvasY - extent.canvasY);
+  const canvasCorners = transform.corners.map((point) => ({ x: point.x - extent.x, y: DOC_HEIGHT - point.y - extent.canvasY }));
+  drawQuadImage(resultContext, transform.contentCanvas, canvasCorners);
+  const offCanvasBefore = layer.offCanvasSource;
+  const offCanvasAfter = retainOffCanvasSource({ ...extent, canvas: result });
+  context.clearRect(0, 0, DOC_WIDTH, DOC_HEIGHT);
+  context.drawImage(result, extent.x, extent.canvasY);
+  layer.offCanvasSource = offCanvasAfter;
+  const after = region.width && region.height
+    ? new Uint8Array(context.getImageData(region.x0, region.canvasY, region.width, region.height).data)
+    : new Uint8Array();
   const transformedSelection = {
     layerId: layer.id,
     type: "polygon",
     closed: true,
-    points: transformedSelectionPoints(transform).map(clampDocumentPoint),
+    points: transformedSelectionPoints(transform),
   };
+  releaseManualPointerCapture();
   releaseLayerTransformPreview(transform);
   state.manualSelection = transformedSelection;
   state.layerTransform = null;
@@ -4145,7 +4205,7 @@ function commitLayerTransform() {
     width: region.width,
     height: region.height,
     canvasY: region.canvasY,
-  }, before, after, transform.originalSelection, transformedSelection);
+  }, before, after, transform.originalSelection, transformedSelection, offCanvasBefore, offCanvasAfter);
   refreshLayerThumbnail(layer);
   renderLayers();
   drawManualEditingOverlay();
@@ -4168,11 +4228,8 @@ function transformHandleAt(event) {
   if (!transform) return -1;
   const pointer = { x: event.clientX, y: event.clientY };
   const rect = canvas.getBoundingClientRect();
-  const scaleX = rect.width / Math.max(1, canvas.clientWidth);
-  const scaleY = rect.height / Math.max(1, canvas.clientHeight);
   const handles = [...transformHandlePoints(transform), transformRotationHandle(transform).handle].map((point) => {
-    const overlay = overlayPoint(point);
-    return { x: rect.left + overlay.x * scaleX, y: rect.top + overlay.y * scaleY };
+    return { x: rect.left + point.x / DOC_WIDTH * rect.width, y: rect.top + (1 - point.y / DOC_HEIGHT) * rect.height };
   });
   return handles.findIndex((point) => Math.hypot(point.x - pointer.x, point.y - pointer.y) <= 11);
 }
@@ -4182,7 +4239,7 @@ function beginTransformInteraction(event) {
   if (!transform || event.button !== 0) return;
   event.preventDefault();
   canvas.setPointerCapture(event.pointerId);
-  const point = clampDocumentPoint(pointerToDocument(event));
+  const point = pointerToDocument(event);
   const handle = transformHandleAt(event);
   const inside = pointInPolygon(point, transform.corners);
   state.manualInteraction = {
@@ -6273,6 +6330,7 @@ async function duplicateLayer(layer) {
     filtersEnabled: layer.filtersEnabled !== false,
     matchFilterRatio: layer.matchFilterRatio === true,
     sourceDataUrl: layer.sourceDataUrl,
+    offCanvasSource: serializeOffCanvasSource(layer.offCanvasSource),
     material: layer.material ? { ...layer.material } : null,
     height: layer.height ? { ...layer.height } : null,
     mask: layer.mask ? {} : null,
@@ -6306,11 +6364,14 @@ function insertLayerAboveSelection(layer, selectedLayerId = state.selectedLayerI
 }
 
 async function createBaseCopyLayer() {
+  if (state.layerTransform) commitLayerTransform();
+  flushDirtyPaintLayerDataUrls();
   const base = state.layers[0];
   if (!base) return;
   const selectedLayerId = state.selectedLayerId;
   const copy = await createLayerFromImage(base.sourceDataUrl, `${base.name} copy`, {
     kind: "image",
+    offCanvasSource: serializeOffCanvasSource(base.offCanvasSource),
     filters: [],
     opacity: 1,
     blendMode: "normal",
@@ -8193,6 +8254,7 @@ function createHistorySnapshotMetadata(snapshot) {
   const references = new Set();
   snapshot.layers.forEach((layer) => {
     collectDataUrlReferences(layer.sourceDataUrl, references);
+    collectDataUrlReferences(layer.offCanvasSource, references);
     collectDataUrlReferences(layer.material, references);
     layer.filters.forEach((filter) => collectDataUrlReferences(filter.params, references));
   });
@@ -8205,9 +8267,12 @@ function createHistorySnapshotMetadata(snapshot) {
 }
 
 function createHistoryActionMetadata(action, estimatedBytes) {
+  const references = new Set();
+  collectDataUrlReferences(action.offCanvasBefore?.dataUrl, references);
+  collectDataUrlReferences(action.offCanvasAfter?.dataUrl, references);
   Object.defineProperties(action, {
     type: { value: "action", enumerable: false },
-    assetDataUrls: { value: Object.freeze([]), enumerable: false },
+    assetDataUrls: { value: Object.freeze([...references]), enumerable: false },
     estimatedBytes: { value: estimatedBytes, enumerable: false },
   });
   return action;
@@ -8217,6 +8282,7 @@ function collectLiveDocumentDataUrls() {
   const references = new Set();
   state.layers.forEach((layer) => {
     collectDataUrlReferences(layer.sourceDataUrl, references);
+    collectDataUrlReferences(layer.offCanvasSource?.dataUrl, references);
     collectDataUrlReferences(layer.material, references);
     layer.filters.forEach((filter) => collectDataUrlReferences(filter.params, references));
   });
@@ -8281,6 +8347,7 @@ function captureHistorySnapshot() {
       matchFilterRatio: layer.matchFilterRatio === true,
       filtersEnabled: layer.filtersEnabled !== false,
       sourceDataUrl: layer.sourceDataUrl,
+      offCanvasSource: serializeOffCanvasSource(layer.offCanvasSource),
       material: layer.material ? cloneHistoryValue(layer.material) : null,
       height: layer.height ? cloneHistoryValue(layer.height) : null,
       mask: layer.mask ? {
@@ -8366,7 +8433,7 @@ function recordMaskTileHistoryAction(layerId, tiles, initializedBefore, initiali
   scheduleSave();
 }
 
-function recordPaintRegionHistoryAction(layerId, region, before, after, selectionBefore, selectionAfter) {
+function recordPaintRegionHistoryAction(layerId, region, before, after, selectionBefore, selectionAfter, offCanvasBefore, offCanvasAfter) {
   if (state.restoringHistory) return;
   const action = {
     kind: "paint-region",
@@ -8379,9 +8446,17 @@ function recordPaintRegionHistoryAction(layerId, region, before, after, selectio
     action.selectionBefore = cloneHistoryValue(selectionBefore);
     action.selectionAfter = cloneHistoryValue(selectionAfter);
   }
+  if (arguments.length >= 8) {
+    action.offCanvasBefore = offCanvasBefore;
+    action.offCanvasAfter = offCanvasAfter;
+  }
+  const overflowBytes = [offCanvasBefore, offCanvasAfter].reduce(
+    (total, source) => total + (source ? source.canvas.width * source.canvas.height * 4 : 0),
+    0,
+  );
   recordHistoryEntry(createHistoryActionMetadata(
     action,
-    before.byteLength + after.byteLength
+    before.byteLength + after.byteLength + overflowBytes
       + estimateHistoryValueBytes(selectionBefore)
       + estimateHistoryValueBytes(selectionAfter)
       + 160,
@@ -8406,10 +8481,7 @@ function resetDocumentHistory() {
 async function restoreHistorySnapshot(snapshot) {
   state.restoringHistory = true;
   try {
-    if (state.layerTransform) {
-      restoreTransformSource(state.layerTransform);
-      state.layerTransform = null;
-    }
+    if (state.layerTransform) cancelLayerTransform();
     state.manualSelection = null;
     state.manualInteraction = null;
     destroyManualSelectionTexture();
@@ -8429,6 +8501,7 @@ async function restoreHistorySnapshot(snapshot) {
         matchFilterRatio: item.matchFilterRatio === true,
         filtersEnabled: item.filtersEnabled !== false,
         sourceDataUrl: item.sourceDataUrl,
+        offCanvasSource: item.offCanvasSource,
         material: item.material,
         height: item.height,
         mask: item.mask ? {} : null,
@@ -8531,30 +8604,35 @@ function applyHistoryAction(action, direction) {
     const context = layer.sourceCanvas.getContext("2d", { alpha: true });
     const region = action.region;
     const pixels = direction === "undo" ? action.before : action.after;
-    const image = new ImageData(new Uint8ClampedArray(pixels), region.width, region.height);
-    context.putImageData(image, region.x, region.canvasY);
-    const flipped = new Uint8Array(pixels.length);
-    const rowLength = region.width * 4;
-    for (let row = 0; row < region.height; row += 1) {
-      flipped.set(
-        pixels.subarray((region.height - 1 - row) * rowLength, (region.height - row) * rowLength),
-        row * rowLength,
-      );
+    if (Object.prototype.hasOwnProperty.call(action, "offCanvasBefore")) {
+      layer.offCanvasSource = direction === "undo" ? action.offCanvasBefore : action.offCanvasAfter;
     }
-    [layer.sourceTexture, layer.paintScratchTexture].forEach((texture) => {
-      gl.bindTexture(gl.TEXTURE_2D, texture);
-      gl.texSubImage2D(
-        gl.TEXTURE_2D,
-        0,
-        region.x,
-        region.y,
-        region.width,
-        region.height,
-        gl.RGBA,
-        gl.UNSIGNED_BYTE,
-        flipped,
-      );
-    });
+    if (region.width && region.height) {
+      const image = new ImageData(new Uint8ClampedArray(pixels), region.width, region.height);
+      context.putImageData(image, region.x, region.canvasY);
+      const flipped = new Uint8Array(pixels.length);
+      const rowLength = region.width * 4;
+      for (let row = 0; row < region.height; row += 1) {
+        flipped.set(
+          pixels.subarray((region.height - 1 - row) * rowLength, (region.height - row) * rowLength),
+          row * rowLength,
+        );
+      }
+      [layer.sourceTexture, layer.paintScratchTexture].forEach((texture) => {
+        gl.bindTexture(gl.TEXTURE_2D, texture);
+        gl.texSubImage2D(
+          gl.TEXTURE_2D,
+          0,
+          region.x,
+          region.y,
+          region.width,
+          region.height,
+          gl.RGBA,
+          gl.UNSIGNED_BYTE,
+          flipped,
+        );
+      });
+    }
     layer.sourceRevision = (layer.sourceRevision || 0) + 1;
     if (Object.prototype.hasOwnProperty.call(action, "selectionBefore")) {
       state.manualSelection = cloneHistoryValue(
@@ -8574,8 +8652,11 @@ function applyHistoryAction(action, direction) {
 
 async function undoDocument() {
   if (state.layerTransform) {
-    cancelLayerTransform();
-    return;
+    if (!hasLayerTransformChanges()) {
+      cancelLayerTransform();
+      return;
+    }
+    commitLayerTransform();
   }
   if (state.historyIndex <= 0) return;
   const current = state.history[state.historyIndex];
@@ -8591,8 +8672,11 @@ async function undoDocument() {
 
 async function redoDocument() {
   if (state.layerTransform) {
+    if (hasLayerTransformChanges()) {
+      commitLayerTransform();
+      return;
+    }
     cancelLayerTransform();
-    return;
   }
   if (state.historyIndex < 0 || state.historyIndex >= state.history.length - 1) return;
   state.historyIndex += 1;
@@ -8635,7 +8719,7 @@ function estimateMaskAutosaveCharacters(mask) {
 
 function estimateLocalAutosaveCharacters() {
   return state.layers.reduce((total, layer) => {
-    const source = String(layer.sourceDataUrl || "").length;
+    const source = String(layer.sourceDataUrl || "").length + (layer.offCanvasSource?.dataUrl.length || 0);
     const material = countEmbeddedDataUrlCharacters(layer.material);
     const filters = countEmbeddedDataUrlCharacters(layer.filters.map((filter) => filter.params));
     // Uniform masks encode compactly. Varied masks use the conservative raw-data estimate
@@ -8668,6 +8752,7 @@ function serializeDocument({ includeBinary = true } = {}) {
       alphaLock: layer.alphaLock,
       adjustmentStartLayerId: layer.adjustmentStartLayerId,
       sourceDataUrl: includeBinary ? layer.sourceDataUrl : null,
+      offCanvasSource: includeBinary ? serializeOffCanvasSource(layer.offCanvasSource) : null,
       material: layer.material
         ? (includeBinary ? { ...layer.material } : stripEmbeddedDataUrls(layer.material))
         : null,
@@ -8990,6 +9075,7 @@ async function applyStoredDocument(stored) {
         filtersEnabled: item.filtersEnabled !== false,
         matchFilterRatio: item.matchFilterRatio === true,
         sourceDataUrl: item.sourceDataUrl,
+        offCanvasSource: item.offCanvasSource,
         material: item.material,
         height: item.height,
         mask: item.mask,
@@ -9160,6 +9246,67 @@ async function createNewDocument() {
   state.newDocumentPending = true;
   imageInput.click();
   showToast("Choose an image to start the new document.");
+}
+
+function isImageImportFile(file) {
+  return file.type.startsWith("image/") || (
+    (!file.type || file.type === "application/octet-stream")
+    && /\.(apng|avif|bmp|gif|ico|jpe?g|png|svg|webp)$/i.test(file.name)
+  );
+}
+
+function isFileDrag(event) {
+  return Array.from(event.dataTransfer?.types || []).includes("Files");
+}
+
+async function importImageFile(file, { isNewDocument = false } = {}) {
+  if (!isImageImportFile(file)) throw new Error(`"${file.name}" is not a supported image file.`);
+  const selectedLayerId = state.selectedLayerId;
+  const dataUrl = await readFileAsDataUrl(file);
+  const layer = await createLayerFromImage(dataUrl, file.name.replace(/\.[^.]+$/, ""), { nativeDimensions: isNewDocument });
+  if (isNewDocument) {
+    if (state.layerTransform) cancelLayerTransform();
+    state.layers.forEach(destroyLayerGpu);
+    state.layers = [layer];
+    state.documentName = normalizeProjectName(file.name.replace(/\.[^.]+$/, ""));
+    state.projectFilePath = null;
+    state.viewport = { x: 0, y: 0 };
+    setZoom(80);
+    syncDocumentMeta();
+    syncViewport();
+    renderFilters();
+    resetDocumentHistory();
+  } else {
+    insertLayerAboveSelection(layer, selectedLayerId);
+  }
+  selectLayer(layer.id, "mask");
+  requestRender();
+  if (isNewDocument) scheduleSave();
+  else commitDocumentAction();
+  showToast(isNewDocument ? "Image opened as an editable document." : "Image added as a new layer.");
+}
+
+async function importDroppedImageFiles(files) {
+  if (!files.length) {
+    showToast("Drop image files, not folders, to add image layers.");
+    return;
+  }
+  let imported = 0;
+  const failed = [];
+  for (const file of files) {
+    try {
+      await importImageFile(file);
+      imported += 1;
+    } catch (error) {
+      failed.push(file.name);
+      reportError(error);
+    }
+  }
+  if (failed.length) {
+    showToast(`Imported ${imported} image(s). Could not import: ${failed.join(", ")}.`);
+  } else if (imported > 1) {
+    showToast(`${imported} images added as new layers.`);
+  }
 }
 
 function exportPng() {
@@ -9421,6 +9568,11 @@ function wireEvents() {
   canvas.addEventListener("pointerup", handleCanvasPointerEnd);
   canvas.addEventListener("pointercancel", handleCanvasPointerEnd);
   canvas.addEventListener("wheel", handleCanvasWheel, { passive: false });
+  canvasStage.addEventListener("pointerdown", (event) => {
+    if (state.activeTool !== "transform" || event.target === canvas) return;
+    if (![canvasStage, canvasWrap, selectionOverlay].includes(event.target)) return;
+    handleCanvasPointerDown(event);
+  });
   canvas.addEventListener("pointerleave", (event) => {
     if (state.paintPointerId === null) brushCursor.style.opacity = "0";
     else updateBrushCursor(event);
@@ -10074,36 +10226,8 @@ function wireEvents() {
     const file = imageInput.files?.[0];
     if (!file) return;
     const isNewDocument = state.newDocumentPending;
-    const selectedLayerId = state.selectedLayerId;
     try {
-      const dataUrl = await new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(reader.result);
-        reader.onerror = () => reject(new Error("The selected image could not be read."));
-        reader.readAsDataURL(file);
-      });
-      const layer = await createLayerFromImage(dataUrl, file.name.replace(/\.[^.]+$/, ""), { nativeDimensions: isNewDocument });
-      if (isNewDocument) {
-        if (state.layerTransform) cancelLayerTransform();
-        state.layers.forEach(destroyLayerGpu);
-        state.layers = [layer];
-        state.documentName = normalizeProjectName(file.name.replace(/\.[^.]+$/, ""));
-        state.projectFilePath = null;
-        state.viewport = { x: 0, y: 0 };
-        setZoom(80);
-        syncDocumentMeta();
-        syncViewport();
-        renderFilters();
-        resetDocumentHistory();
-      } else {
-        insertLayerAboveSelection(layer, selectedLayerId);
-      }
-      state.newDocumentPending = false;
-      selectLayer(layer.id, "mask");
-      requestRender();
-      if (isNewDocument) scheduleSave();
-      else commitDocumentAction();
-      showToast(isNewDocument ? "Image opened as an editable document." : "Image added as a new layer.");
+      await importImageFile(file, { isNewDocument });
     } catch (error) {
       reportError(error);
     } finally {
@@ -10114,6 +10238,20 @@ function wireEvents() {
   imageInput.addEventListener("cancel", () => {
     state.newDocumentPending = false;
   });
+  let imageDropQueue = Promise.resolve();
+  document.addEventListener("dragover", (event) => {
+    if (!isFileDrag(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.dataTransfer.dropEffect = "copy";
+  }, true);
+  document.addEventListener("drop", (event) => {
+    if (!isFileDrag(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const files = Array.from(event.dataTransfer.files);
+    imageDropQueue = imageDropQueue.then(() => importDroppedImageFiles(files)).catch(reportError);
+  }, true);
 
   document.getElementById("addFilterButton").addEventListener("click", () => {
     filterMenu.hidden = !filterMenu.hidden;
@@ -10859,7 +10997,7 @@ function wireEvents() {
       if (!event.repeat) setActiveManualTool("brush");
       return;
     }
-    if (!modifier && !event.altKey && event.code === "KeyV") {
+    if (!modifier && !event.altKey && (event.code === "KeyT" || event.code === "KeyV")) {
       consumeCanvasShortcut(event);
       if (!event.repeat) setActiveManualTool("transform");
       return;
@@ -10881,9 +11019,13 @@ function wireEvents() {
       return;
     }
     if (event.key === "Enter") {
-      if (state.layerTransform) {
+      if (state.activeTool === "transform") {
         consumeCanvasShortcut(event);
-        commitLayerTransform();
+        if (state.manualInteraction) {
+          releaseManualPointerCapture();
+          state.manualInteraction = null;
+        }
+        setActiveManualTool("brush");
         return;
       }
       if (state.manualSelection?.type === "polygon" && state.manualSelection.closed === false) {
