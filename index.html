@@ -226,7 +226,7 @@
                 <h2>Layers</h2>
                 <button class="mini-button" id="collapseLayers" title="Collapse layers" aria-label="Collapse layers">&rsaquo;</button>
               </div>
-              <div class="dock-header-actions"><button class="header-add" id="addLayerButton" title="New layer">+</button></div>
+              <div class="dock-header-actions"><button class="header-add" id="addLayerButton" title="New layer" aria-label="New layer"><span class="duo-layer-add-label">Layer</span>+</button></div>
             </div>
             <div class="layer-global-controls">
               <div class="blend-select" id="blendSelect">
@@ -480,14 +480,17 @@
         <select id="dualScreenMode">
           <option value="auto">Auto-detect screens</option>
           <option value="manual">Duo compatibility mode</option>
+          <option value="manual-horizontal">Duo: side-by-side screens (manual)</option>
+          <option value="manual-vertical">Duo: stacked screens (manual)</option>
           <option value="single">Single-screen layout</option>
         </select>
+        <p id="dualScreenStatus" class="settings-note" role="status" aria-live="polite"></p>
         <label class="settings-number-row" for="hingeWidth">
           <span>Hinge gap</span>
           <input id="hingeWidth" type="number" min="0" max="200" step="1" value="34" required />
           <small>CSS px</small>
         </label>
-        <p class="settings-note">Span the browser across both screens first. Auto uses the actual screen boundaries. If your browser cannot detect them, choose Duo compatibility mode and adjust the gap. It follows rotation and returns to a single-screen layout when folded to a smaller window.</p>
+        <p class="settings-note">Span the browser across both screens first. Auto uses actual screen boundaries, including unequal areas beside system or browser bars. Duo compatibility follows window rotation and returns to one screen when folded. If bars or scaling confuse detection, choose the actual side-by-side or stacked arrangement manually and adjust the gap. Fixed arrangements estimate equal areas and do not follow rotation; switch back to Auto when folded.</p>
       </section>
       <section class="settings-section">
         <span class="settings-section-label">Shortcuts</span>

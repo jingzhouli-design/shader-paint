@@ -6129,7 +6129,7 @@ function renderLayers() {
       ? `<button class="mask-thumb ${maskActive ? "active" : ""} ${maskAdjusted ? "adjusted" : ""} ${maskDisabled ? "disabled" : ""} ${layer.mask.boundLayerId ? "bound" : ""}" data-select-part="mask" style="background-image:url('${maskThumbnail(layer)}')" title="${maskDisabled ? "Mask disabled — click to select" : "Paint layer mask"}"></button>`
       : "";
     return `
-      <article class="layer-row ${selected ? "selected" : ""} ${layer.visible ? "visible" : ""} ${layer.clipDown ? "clipped-down" : ""} ${layer.id === linkedTargetId ? "adjustment-target" : ""}" draggable="true" data-layer-id="${layer.id}">
+      <article class="layer-row ${selected ? "selected" : ""} ${layer.visible ? "visible" : ""} ${layer.clipDown ? "clipped-down" : ""} ${layer.id === linkedTargetId ? "adjustment-target" : ""}" draggable="true" data-layer-id="${layer.id}" aria-label="${escapeHtml(layer.name)}">
         ${layer.clipDown ? '<span class="clip-down-indicator" aria-hidden="true"></span>' : ""}
         <button class="eye-button" data-layer-action="visibility" title="${layer.visible ? "Hide layer" : "Show layer"}">${eyeSvg(layer.visible)}</button>
         <div class="layer-thumb-stack">
@@ -6142,7 +6142,6 @@ function renderLayers() {
     : `<button class="layer-thumb" data-select-part="${selectionPart}" style="background-image:url('${layer.thumbnail}')" title="${selectionPart === "mask" ? "Paint layer mask" : "Select layer"}"></button>`}
           ${maskMarkup}
         </div>
-        <button class="duo-layer-drag-handle" title="Hold and drag to reorder layer" aria-label="Reorder ${escapeHtml(layer.name)}"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6 6h8M6 10h8M6 14h8"/></svg></button>
         <div class="layer-copy" data-select-part="${selectionPart}">
           <span class="layer-name">${escapeHtml(layer.name)}${boundSource ? `<svg class="bound-layer-icon" viewBox="0 0 20 20" aria-label="Used by a bound mask"><path d="M7.5 12.5 12.5 7.5"/><path d="M6.2 14.8 4.8 16.2a3 3 0 0 1-4.2-4.2l3.1-3.1a3 3 0 0 1 4.2 0"/><path d="m13.8 5.2 1.4-1.4a3 3 0 0 1 4.2 4.2l-3.1 3.1a3 3 0 0 1-4.2 0"/></svg>` : ""}</span>
           ${selected ? `<div class="layer-badges">
@@ -6152,7 +6151,7 @@ function renderLayers() {
             ${layer.filters.length ? `<button class="layer-badge ${layer.filtersEnabled !== false ? "active" : ""}" data-layer-status="filters" title="${layer.filtersEnabled !== false ? "Disable filters for this layer" : "Enable filters for this layer"}">${layer.filters.length} FX</button>` : ""}
           </div>` : ""}
         </div>
-        ${selected ? '<button class="layer-action-button" data-layer-action="menu" title="Layer actions">•••</button>' : ""}
+        <button class="layer-action-button" data-layer-action="menu" title="Layer actions" aria-label="Layer settings: ${escapeHtml(layer.name)}">•••</button>
       </article>`;
   }).join("");
   syncLayerControls();
@@ -6278,11 +6277,21 @@ function syncDuoLayerUi() {
   title.title = title.textContent;
 }
 
+function toggleLayerVisibility(layer) {
+  if (state.layerTransform?.layerId === layer.id) commitLayerTransform();
+  layer.visible = !layer.visible;
+  if (!layer.visible) releaseHiddenLayerTextures(layer);
+  renderLayers();
+  requestRender();
+  commitDocumentAction();
+}
+
 function showLayerMenu(row, layer) {
   document.querySelectorAll(".layer-actions-menu").forEach((menu) => menu.remove());
   const menu = document.createElement("div");
   menu.className = "layer-actions-menu";
   menu.innerHTML = `
+    ${dualScreenLayout ? `<button data-menu-action="visibility">${layer.visible ? "Hide" : "Show"} layer</button>` : ""}
     <button data-menu-action="rename">Rename layer</button>
     <button data-menu-action="duplicate">Duplicate layer</button>
     <div class="layer-actions-divider"></div>
@@ -6553,6 +6562,10 @@ function deleteLayer(layer) {
 }
 
 function handleLayerMenuAction(layer, action) {
+  if (action === "visibility") {
+    toggleLayerVisibility(layer);
+    return;
+  }
   if (state.layerTransform) commitLayerTransform();
   let documentChanged = false;
   if (action === "rename") {
@@ -8015,7 +8028,7 @@ function loadProjectSettings() {
       && Number.isFinite(stored.ipad.brushPanelPosition.y)
       ? stored.ipad.brushPanelPosition
       : null;
-    state.workspace.dualScreenMode = ["auto", "manual", "single"].includes(stored.workspace?.dualScreenMode)
+    state.workspace.dualScreenMode = ["auto", "manual", "manual-horizontal", "manual-vertical", "single"].includes(stored.workspace?.dualScreenMode)
       ? stored.workspace.dualScreenMode : "auto";
     state.workspace.hingeWidth = clampPressureSetting(stored.workspace?.hingeWidth, 0, 200, 34);
     state.pressure.sizeMinimum = clampPressureSetting(stored.pressure?.sizeMinimum, 0, 1, 0.32);
@@ -8085,7 +8098,8 @@ function syncSettingsPanel() {
   ignoreTouchDraw.checked = state.ipad.ignoreTouchDraw;
   dualScreenMode.value = state.workspace.dualScreenMode;
   hingeWidth.value = String(state.workspace.hingeWidth);
-  hingeWidth.disabled = state.workspace.dualScreenMode !== "manual";
+  hingeWidth.disabled = !state.workspace.dualScreenMode.startsWith("manual");
+  syncDualScreenStatus();
   syncPressureSettings();
 }
 
@@ -8119,25 +8133,31 @@ function dualScreenGeometry(segments, width, height) {
   if (rects.some((rect) => !Object.values(rect).every(Number.isFinite)
     || rect.x < 0 || rect.y < 0 || rect.width <= 0 || rect.height <= 0
     || rect.x + rect.width > width + 1 || rect.y + rect.height > height + 1)) return null;
-  rects.sort((a, b) => Math.abs(a.x - b.x) < 1 ? a.y - b.y : a.x - b.x);
-  const [first, second] = rects;
-  const sideBySide = Math.abs(first.y - second.y) < 1 && Math.abs(first.height - second.height) < 1
-    && first.x + first.width <= second.x;
-  const stacked = Math.abs(first.x - second.x) < 1 && Math.abs(first.width - second.width) < 1
-    && first.y + first.height <= second.y;
-  if (!sideBySide && !stacked) return null;
-  return { axis: sideBySide ? "horizontal" : "vertical", canvas: first, controls: second };
+  const [left, right] = [...rects].sort((a, b) => a.x - b.x);
+  const overlapY = Math.min(left.y + left.height, right.y + right.height) - Math.max(left.y, right.y);
+  if (left.x + left.width <= right.x && overlapY > 0) {
+    return { axis: "horizontal", canvas: left, controls: right };
+  }
+  const [top, bottom] = [...rects].sort((a, b) => a.y - b.y);
+  const overlapX = Math.min(top.x + top.width, bottom.x + bottom.width) - Math.max(top.x, bottom.x);
+  if (top.y + top.height <= bottom.y && overlapX > 0) {
+    return { axis: "vertical", canvas: top, controls: bottom };
+  }
+  return null;
 }
 
-function manualDualScreenSegments(width, height, gap) {
-  if (width >= height && width >= 900 && height >= 500) {
+function manualDualScreenSegments(width, height, gap, arrangement = "auto") {
+  const horizontal = arrangement === "horizontal" || (arrangement === "auto" && width >= height);
+  const vertical = arrangement === "vertical" || (arrangement === "auto" && height > width);
+  const forced = arrangement !== "auto";
+  if (horizontal && (forced ? width - gap >= 640 && height >= 320 : width >= 900 && height >= 500)) {
     const segmentWidth = (width - gap) / 2;
     return [
       { x: 0, y: 0, width: segmentWidth, height },
       { x: segmentWidth + gap, y: 0, width: segmentWidth, height },
     ];
   }
-  if (height > width && height >= 900 && width >= 500) {
+  if (vertical && (forced ? height - gap >= 640 && width >= 320 : height >= 900 && width >= 500)) {
     const segmentHeight = (height - gap) / 2;
     return [
       { x: 0, y: 0, width, height: segmentHeight },
@@ -8148,10 +8168,16 @@ function manualDualScreenSegments(width, height, gap) {
 }
 
 function readViewportSegments() {
-  if (Array.isArray(window.viewport?.segments)) return window.viewport.segments;
-  if (Array.isArray(window.visualViewport?.segments)) return window.visualViewport.segments;
-  if (typeof window.getWindowSegments === "function") return window.getWindowSegments();
-  if (!horizontalSegments.matches && !verticalSegments.matches) return [];
+  const candidates = [window.viewport?.segments, window.visualViewport?.segments];
+  for (const segments of candidates) {
+    if (dualScreenGeometry(segments, window.innerWidth, window.innerHeight)) return segments;
+  }
+  if (typeof window.getWindowSegments === "function") {
+    const segments = window.getWindowSegments();
+    if (dualScreenGeometry(segments, window.innerWidth, window.innerHeight)) return segments;
+    candidates.push(segments);
+  }
+  if (!horizontalSegments.matches && !verticalSegments.matches) return candidates.find(Array.isArray) || [];
   return [[0, 0], horizontalSegments.matches ? [1, 0] : [0, 1]].map(([column, row]) => {
     const probe = document.createElement("div");
     probe.style.cssText = `position:fixed;visibility:hidden;pointer-events:none;
@@ -8164,6 +8190,23 @@ function readViewportSegments() {
     probe.remove();
     return rect;
   });
+}
+
+function syncDualScreenStatus() {
+  const mode = state.workspace.dualScreenMode;
+  const viewport = `Viewport: ${window.innerWidth} x ${window.innerHeight} CSS px.`;
+  if (dualScreenLayout) {
+    const { axis, canvas, controls } = dualScreenLayout;
+    const size = (rect) => `${Number(rect.width.toFixed(1))} x ${Number(rect.height.toFixed(1))}`;
+    document.getElementById("dualScreenStatus").textContent = `${viewport} ${axis === "horizontal" ? "Side-by-side" : "Stacked"} screens (${mode === "auto" ? "detected" : "manual estimate"}). Canvas: ${size(canvas)}; controls: ${size(controls)}.`;
+  } else {
+    const reason = mode === "auto"
+      ? "No usable dual-screen boundaries reported. Span the browser across both screens, or choose a manual arrangement."
+      : mode === "single" ? "Dual-screen detection is disabled."
+        : mode === "manual" ? "Automatic compatibility needs a 900 x 500 or 500 x 900 CSS px window. For a smaller spanned window, choose a fixed arrangement."
+        : "Window is too small for this arrangement. Each manual screen needs at least 320 CSS px in both dimensions.";
+    document.getElementById("dualScreenStatus").textContent = `${viewport} Single-screen workspace. ${reason}`;
+  }
 }
 
 function initializePhoneLayout() {
@@ -8234,10 +8277,12 @@ function initializePhoneLayout() {
     if (name) setPanel.lastPanel = name;
   };
   const syncLayout = () => {
-    const segments = state.workspace.dualScreenMode === "manual"
-      ? manualDualScreenSegments(window.innerWidth, window.innerHeight, state.workspace.hingeWidth)
+    const layoutMode = state.workspace.dualScreenMode;
+    const segments = layoutMode.startsWith("manual")
+      ? manualDualScreenSegments(window.innerWidth, window.innerHeight, state.workspace.hingeWidth, layoutMode === "manual" ? "auto" : layoutMode.slice(7))
       : state.workspace.dualScreenMode === "single" ? [] : readViewportSegments();
     dualScreenLayout = dualScreenGeometry(segments, window.innerWidth, window.innerHeight);
+    syncDualScreenStatus();
     const phone = usesTouchWorkspace();
     const mode = dualScreenLayout ? "duo" : phone ? "phone" : "desktop";
     document.body.classList.toggle("duo-layout", Boolean(dualScreenLayout));
@@ -10416,14 +10461,9 @@ function wireEvents() {
       renderLayers();
       renderFilters();
     } else if (action === "visibility") {
-      if (state.layerTransform?.layerId === layer.id) commitLayerTransform();
-      layer.visible = !layer.visible;
-      if (!layer.visible) releaseHiddenLayerTextures(layer);
-      renderLayers();
-      requestRender();
-      commitDocumentAction();
+      toggleLayerVisibility(layer);
     } else if (action === "menu") {
-      selectLayer(layer.id, state.selectionPart);
+      selectLayer(layer.id, layer.id === state.selectedLayerId ? state.selectionPart : "content");
       const activeRow = layerList.querySelector(`[data-layer-id="${layer.id}"]`);
       if (activeRow) showLayerMenu(activeRow, layer);
     } else if (status === "clip") {
@@ -10500,35 +10540,66 @@ function wireEvents() {
   let layerPress = null;
   const clearLayerPress = () => {
     if (layerPress?.timer) window.clearTimeout(layerPress.timer);
+    if (layerPress?.captureTarget.hasPointerCapture(layerPress.pointerId)) layerPress.captureTarget.releasePointerCapture(layerPress.pointerId);
     layerList.querySelectorAll(".touch-dragging, .drop-before, .drop-after").forEach((item) => {
       item.classList.remove("touch-dragging", "drop-before", "drop-after");
     });
     layerPress = null;
   };
   layerList.addEventListener("pointerdown", (event) => {
-    const railHandle = dualScreenLayout && event.target.closest(".duo-layer-drag-handle");
-    if (event.pointerType === "mouse" || (!railHandle && event.target.closest("button, input, .layer-name"))) return;
+    const railThumbnail = Boolean(dualScreenLayout && event.target.closest(".layer-thumb"));
+    const mouse = event.pointerType === "mouse";
+    if ((mouse && (!railThumbnail || event.button !== 0)) || (!railThumbnail && event.target.closest("button, input, .layer-name"))) return;
     const row = event.target.closest(".layer-row");
     if (!row) return;
     layerPress = {
       pointerId: event.pointerId,
       layerId: row.dataset.layerId,
       active: false,
+      railThumbnail,
+      mouse,
+      captureTarget: mouse ? event.target.closest(".layer-thumb") : layerList,
+      scrolling: false,
+      scrollTop: layerList.scrollTop,
       startX: event.clientX,
       startY: event.clientY,
     };
-    layerPress.timer = window.setTimeout(() => {
+    layerPress.startDrag = () => {
       if (!layerPress || layerPress.pointerId !== event.pointerId) return;
       layerPress.active = true;
       row.classList.add("touch-dragging");
-      layerList.setPointerCapture(event.pointerId);
-      if (navigator.vibrate) navigator.vibrate(12);
-    }, TOUCH_REORDER_DELAY_MS);
+      layerPress.captureTarget.setPointerCapture(event.pointerId);
+      if (!mouse && navigator.vibrate) navigator.vibrate(12);
+    };
+    if (mouse) {
+      event.preventDefault();
+      layerPress.captureTarget.setPointerCapture(event.pointerId);
+    }
+    else layerPress.timer = window.setTimeout(layerPress.startDrag, TOUCH_REORDER_DELAY_MS);
   });
   layerList.addEventListener("pointermove", (event) => {
     if (!layerPress || layerPress.pointerId !== event.pointerId) return;
-    if (!layerPress.active && Math.hypot(event.clientX - layerPress.startX, event.clientY - layerPress.startY) > 10) {
+    if (layerPress.mouse && !(event.buttons & 1)) {
       clearLayerPress();
+      return;
+    }
+    if (!layerPress.active && Math.hypot(event.clientX - layerPress.startX, event.clientY - layerPress.startY) > 10) {
+      if (!layerPress.railThumbnail) {
+        clearLayerPress();
+        return;
+      }
+      if (layerPress.mouse) {
+        layerPress.startDrag();
+      } else if (!layerPress.scrolling) {
+        window.clearTimeout(layerPress.timer);
+        layerPress.timer = null;
+        layerPress.scrolling = true;
+        layerList.setPointerCapture(event.pointerId);
+      }
+    }
+    if (layerPress.scrolling) {
+      event.preventDefault();
+      layerList.scrollTop = layerPress.scrollTop + layerPress.startY - event.clientY;
       return;
     }
     if (!layerPress.active) return;
@@ -10542,6 +10613,12 @@ function wireEvents() {
   layerList.addEventListener("pointerup", (event) => {
     if (!layerPress || layerPress.pointerId !== event.pointerId) return;
     const press = layerPress;
+    if (press.scrolling) {
+      event.preventDefault();
+      suppressLayerClickUntil = performance.now() + 350;
+      clearLayerPress();
+      return;
+    }
     if (!press.active) {
       clearLayerPress();
       return;

@@ -86,6 +86,9 @@ This includes iPhone portrait/landscape and folded Duo touch screens.
   Menus and libraries fit the phone viewport; long controls scroll vertically.
   iOS safe-area insets and dynamic viewport height keep controls clear of the
   home indicator and browser chrome.
+- Filter cards use tighter spacing on phones and Duo while keeping 44px
+  header-button and parameter-row targets. Filter scrollbars are hidden on
+  these layouts; vertical scrolling and parameter sliders remain available.
 - Returning to desktop restores the original panel positions and collapse
   preferences without writing phone panel state into desktop settings.
 - Desktop canvas fitting follows the responsive panel widths, rather than
@@ -101,11 +104,16 @@ segments, the app places the canvas and its toolbar entirely on the first
 screen and a filter-first workspace on the second. Filters use the main area;
 an independently scrolling 88px layer rail stays visible at the far right.
 Tap a thumbnail to change the layer and its filters. The header identifies the
-current layer. Hold and drag the grip beside a thumbnail to reorder layers;
-scrolling on the thumbnails or names still scrolls the rail.
+current layer. The rail itself shows only a thumbnail and **...** settings
+button for each layer, without names, visibility buttons or drag handles.
+The rail header is a single **Layer +** button to create layers, without a
+separate Layers heading.
+Drag the thumbnail with a mouse to reorder. On touch screens, swipe a thumbnail
+to scroll the rail or hold it briefly before dragging to reorder.
 
-The selected layer's **...** button (or **Layer settings** in the top bar)
-opens its name, blend mode, opacity, mask and layer actions on demand. Tap
+Any layer's **...** button selects that layer and opens its name, visibility,
+blend mode, opacity, mask and layer actions on demand; **Layer settings** in the
+top bar opens the selected layer. Hidden layers have dimmed thumbnails. Tap
 **Done**, outside the settings, or press Escape to dismiss. **Brush** opens
 temporary brush controls without replacing the layer rail; Done, Filters,
 Escape or selecting a layer returns to filters. Phone tabs and desktop panels
@@ -113,6 +121,10 @@ keep their existing layout.
 
 The actual hinge gap is excluded, including from menus, libraries and settings.
 Switching controls never shrinks the canvas.
+Detected screen regions do not need matching heights, widths or edge offsets:
+browser address bars and Android navigation bars can reduce only one region.
+The app preserves the reported usable rectangles and hinge position instead of
+rejecting them or dividing the total viewport into equal halves.
 Rotating to stacked screens puts the canvas above the controls; folding back
 to one screen restores the normal responsive layout without changing the
 document, undo history, or desktop panel preferences.
@@ -120,6 +132,8 @@ document, undo history, or desktop panel preferences.
 Automatic detection supports `window.viewport.segments`, the earlier
 `visualViewport.segments`/`getWindowSegments()` APIs, and CSS viewport-segment
 media queries/environment variables. Support depends on the browser and OS.
+An empty or invalid newer API no longer prevents a valid older API or CSS
+viewport-segment detection from being used.
 If detection is unavailable, choose **Settings > Dual-screen workspace > Duo
 compatibility mode** and set **Hinge gap** in CSS pixels. This manual fallback
 assumes two equal screens, starts with a 34px gap, and follows window orientation.
@@ -127,6 +141,22 @@ It activates at 900 x 500 or larger in landscape, or 500 x 900 in portrait;
 smaller folded windows return to single-screen layout. Choose **Single-screen
 layout** to disable spanning detection. These preferences are application
 settings, not part of project files. Physical Duo testing is still recommended.
+
+If browser bars, display scaling or a misleading viewport ratio prevent that
+automatic compatibility layout, choose **Duo: side-by-side screens (manual)**
+or **Duo: stacked screens (manual)** explicitly. These fixed arrangements do
+not infer orientation from viewport shape; they require at least 320 CSS pixels
+in both dimensions for each estimated screen. They still estimate equal areas
+around the configured hinge, so native detection is preferable for asymmetric
+browser/system bars. Fixed arrangements do not rotate or detect folding: switch
+back to Auto or Single-screen when no longer spanning both screens.
+
+Settings displays the current viewport size, active arrangement and actual
+detected (or estimated) screen areas. If dual-screen detection is unavailable
+or the compatibility window is too small, it says so rather than silently
+implying Duo mode is active. On Duo, **side-by-side** means two portrait-shaped
+screens; **stacked** means two landscape-shaped screens, regardless of the
+overall window's orientation. See [Microsoft's Duo viewport documentation](https://learn.microsoft.com/en-us/previous-versions/dual-screen/web/css-viewport-segments).
 
 ## Manual image editing
 
