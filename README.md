@@ -66,6 +66,68 @@ hot-reload module responses cannot be reused as production CSS or JavaScript.
 - Preview limits, native-resolution PNG export, iPad input controls, IndexedDB
   recovery, offline support, and the 239 bundled brushes remain unchanged.
 
+## Phone workspace
+
+On screens up to 700 CSS pixels wide (or touch-device landscape screens up to
+980 pixels wide and 700 pixels high), the app uses a canvas-first phone layout.
+This includes iPhone portrait/landscape and folded Duo touch screens.
+
+- Brush, Layers and Effects in the bottom bar open one panel at a time. Tap
+  the active button or Done to return to the full canvas. Landscape places the
+  panel beside the canvas. The same controls and document data are used on PC.
+- The image tool strip has visible labels. Apply and Cancel buttons let you
+  finish transforms without a keyboard. Undo, redo, eraser, Fit and zoom stay
+  reachable on the canvas. Transform handles have larger phone touch targets.
+- Use one finger to draw and two fingers to zoom/pan, with the existing
+  two-finger undo and three-finger redo taps. The "Ignore touch drawing"
+  setting is still respected; turn it off in input settings for finger drawing.
+- File, Import, Export and input settings remain in the compact top bar.
+  Pause/Play FX is available in the editing-panel header.
+  Menus and libraries fit the phone viewport; long controls scroll vertically.
+  iOS safe-area insets and dynamic viewport height keep controls clear of the
+  home indicator and browser chrome.
+- Returning to desktop restores the original panel positions and collapse
+  preferences without writing phone panel state into desktop settings.
+- Desktop canvas fitting follows the responsive panel widths, rather than
+  reserving a fixed 330px in narrow windows. Collapsing the brush frees that
+  space for the canvas; Fit centers the full document at the new size.
+  The mask-painting target label lives in brush controls, outside the zoomed
+  canvas, so it cannot cover the image or grow when zooming.
+
+## Duo dual-screen workspace
+
+Span the browser across both screens. When the browser exposes two viewport
+segments, the app places the canvas and its toolbar entirely on the first
+screen and a filter-first workspace on the second. Filters use the main area;
+an independently scrolling 88px layer rail stays visible at the far right.
+Tap a thumbnail to change the layer and its filters. The header identifies the
+current layer. Hold and drag the grip beside a thumbnail to reorder layers;
+scrolling on the thumbnails or names still scrolls the rail.
+
+The selected layer's **...** button (or **Layer settings** in the top bar)
+opens its name, blend mode, opacity, mask and layer actions on demand. Tap
+**Done**, outside the settings, or press Escape to dismiss. **Brush** opens
+temporary brush controls without replacing the layer rail; Done, Filters,
+Escape or selecting a layer returns to filters. Phone tabs and desktop panels
+keep their existing layout.
+
+The actual hinge gap is excluded, including from menus, libraries and settings.
+Switching controls never shrinks the canvas.
+Rotating to stacked screens puts the canvas above the controls; folding back
+to one screen restores the normal responsive layout without changing the
+document, undo history, or desktop panel preferences.
+
+Automatic detection supports `window.viewport.segments`, the earlier
+`visualViewport.segments`/`getWindowSegments()` APIs, and CSS viewport-segment
+media queries/environment variables. Support depends on the browser and OS.
+If detection is unavailable, choose **Settings > Dual-screen workspace > Duo
+compatibility mode** and set **Hinge gap** in CSS pixels. This manual fallback
+assumes two equal screens, starts with a 34px gap, and follows window orientation.
+It activates at 900 x 500 or larger in landscape, or 500 x 900 in portrait;
+smaller folded windows return to single-screen layout. Choose **Single-screen
+layout** to disable spanning detection. These preferences are application
+settings, not part of project files. Physical Duo testing is still recommended.
+
 ## Manual image editing
 
 Base image and Paint layers support a Photoshop-style tool strip in the upper

@@ -3,6 +3,12 @@ import { FILTER_DEFS, defaultParamsFor, evalGradientAt, fragmentShaderForPass, n
 
 let DOC_WIDTH = 1200;
 let DOC_HEIGHT = 900;
+const phoneLayout = window.matchMedia("(max-width: 700px), (max-width: 980px) and (max-height: 700px) and (pointer: coarse)");
+const horizontalSegments = window.matchMedia("(horizontal-viewport-segments: 2)");
+const verticalSegments = window.matchMedia("(vertical-viewport-segments: 2)");
+let dualScreenLayout = null;
+let activePhonePanel = null;
+let suppressLayerClickUntil = 0;
 const STORAGE_KEY = "shaderpaint:document:v1";
 const STORAGE_METADATA_KEY = "shaderpaint:document:autosave-status:v1";
 const RECOVERY_DATABASE_NAME = "shaderpaint-recovery";
@@ -122,6 +128,8 @@ const settingsPanel = document.getElementById("settingsPanel");
 const projectAutosaveEnabled = document.getElementById("projectAutosaveEnabled");
 const projectAutosaveInterval = document.getElementById("projectAutosaveInterval");
 const ignoreTouchDraw = document.getElementById("ignoreTouchDraw");
+const dualScreenMode = document.getElementById("dualScreenMode");
+const hingeWidth = document.getElementById("hingeWidth");
 const pressureSizeMinimum = document.getElementById("pressureSizeMinimum");
 const pressureSizeMinimumNumber = document.getElementById("pressureSizeMinimumNumber");
 const pressureSizeCurveToggle = document.getElementById("pressureSizeCurveToggle");
@@ -333,6 +341,7 @@ const state = {
   projectSaveStatus: "unsaved",
   projectAutosave: { enabled: false, intervalSeconds: 60 },
   ipad: { ignoreTouchDraw: false, layersCollapsed: false, filtersCollapsed: false, brushPanelPosition: null },
+  workspace: { dualScreenMode: "auto", hingeWidth: 34 },
   pressure: {
     sizeMinimum: 0.32,
     sizeResponse: 1,
@@ -1831,14 +1840,29 @@ function setDocumentDimensions(width, height) {
   document.getElementById("documentSize").textContent = `${DOC_WIDTH} x ${DOC_HEIGHT}`;
 }
 
+function usesTouchWorkspace() {
+  return phoneLayout.matches || Boolean(dualScreenLayout);
+}
+
 function syncCanvasPresentation() {
-  const availableWidth = Math.max(1, Math.min(canvasStage.clientWidth * 0.68, canvasStage.clientWidth - 330));
-  const availableHeight = Math.max(1, canvasStage.clientHeight - 116);
+  const touchWorkspace = usesTouchWorkspace();
+  const layoutStyle = touchWorkspace ? null : getComputedStyle(canvasStage);
+  const availableWidth = touchWorkspace
+    ? Math.max(1, canvasStage.clientWidth - (dualScreenLayout ? 16 : 32))
+    : Math.max(1, Math.min(
+      canvasStage.clientWidth * Number(layoutStyle.getPropertyValue("--canvas-width-fraction")),
+      canvasStage.clientWidth - parseFloat(layoutStyle.getPropertyValue("--canvas-side-clearance")),
+    ));
+  const availableHeight = Math.max(1, canvasStage.clientHeight - (touchWorkspace ? 128 : 116));
   const documentRatio = DOC_WIDTH / DOC_HEIGHT;
   const width = Math.min(availableWidth, availableHeight * documentRatio);
   const height = width / documentRatio;
-  canvasWrap.style.width = `${Math.round(width)}px`;
-  canvasWrap.style.height = `${Math.round(height)}px`;
+  const nextWidth = `${Math.round(width)}px`;
+  const nextHeight = `${Math.round(height)}px`;
+  const changed = canvasWrap.style.width !== nextWidth || canvasWrap.style.height !== nextHeight;
+  canvasWrap.style.width = nextWidth;
+  canvasWrap.style.height = nextHeight;
+  if (changed) requestRender();
   drawManualEditingOverlay();
 }
 
@@ -3679,6 +3703,7 @@ function syncManualToolUi() {
   canvas.classList.toggle("is-transforming", state.activeTool === "transform" && editable);
   canvas.classList.toggle("is-selecting", state.activeTool === "marquee" && editable);
   canvas.classList.toggle("is-filling", state.activeTool === "fill" && editable);
+  document.getElementById("phoneTransformActions").hidden = !usesTouchWorkspace() || state.activeTool !== "transform" || !editable;
 }
 
 function setActiveManualTool(tool) {
@@ -3895,10 +3920,11 @@ function drawManualEditingOverlay() {
     context.fillStyle = "#f3f7f0";
     context.strokeStyle = "#28312d";
     context.lineWidth = 1;
+    const handleRadius = usesTouchWorkspace() ? 6 : 4;
     handles.forEach((point) => {
       const overlay = overlayPoint(point);
       context.beginPath();
-      context.rect(overlay.x - 4, overlay.y - 4, 8, 8);
+      context.rect(overlay.x - handleRadius, overlay.y - handleRadius, handleRadius * 2, handleRadius * 2);
       context.fill();
       context.stroke();
     });
@@ -3910,7 +3936,7 @@ function drawManualEditingOverlay() {
     context.lineTo(rotationHandle.x, rotationHandle.y);
     context.stroke();
     context.beginPath();
-    context.arc(rotationHandle.x, rotationHandle.y, 5, 0, Math.PI * 2);
+    context.arc(rotationHandle.x, rotationHandle.y, usesTouchWorkspace() ? 7 : 5, 0, Math.PI * 2);
     context.fill();
     context.stroke();
     context.restore();
@@ -4231,7 +4257,10 @@ function transformHandleAt(event) {
   const handles = [...transformHandlePoints(transform), transformRotationHandle(transform).handle].map((point) => {
     return { x: rect.left + point.x / DOC_WIDTH * rect.width, y: rect.top + (1 - point.y / DOC_HEIGHT) * rect.height };
   });
-  return handles.findIndex((point) => Math.hypot(point.x - pointer.x, point.y - pointer.y) <= 11);
+  const distances = handles.map((point) => Math.hypot(point.x - pointer.x, point.y - pointer.y));
+  if (!usesTouchWorkspace() || event.pointerType !== "touch") return distances.findIndex((distance) => distance <= 11);
+  const nearest = distances.indexOf(Math.min(...distances));
+  return distances[nearest] <= 22 ? nearest : -1;
 }
 
 function beginTransformInteraction(event) {
@@ -6113,6 +6142,7 @@ function renderLayers() {
     : `<button class="layer-thumb" data-select-part="${selectionPart}" style="background-image:url('${layer.thumbnail}')" title="${selectionPart === "mask" ? "Paint layer mask" : "Select layer"}"></button>`}
           ${maskMarkup}
         </div>
+        <button class="duo-layer-drag-handle" title="Hold and drag to reorder layer" aria-label="Reorder ${escapeHtml(layer.name)}"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6 6h8M6 10h8M6 14h8"/></svg></button>
         <div class="layer-copy" data-select-part="${selectionPart}">
           <span class="layer-name">${escapeHtml(layer.name)}${boundSource ? `<svg class="bound-layer-icon" viewBox="0 0 20 20" aria-label="Used by a bound mask"><path d="M7.5 12.5 12.5 7.5"/><path d="M6.2 14.8 4.8 16.2a3 3 0 0 1-4.2-4.2l3.1-3.1a3 3 0 0 1 4.2 0"/><path d="m13.8 5.2 1.4-1.4a3 3 0 0 1 4.2 4.2l-3.1 3.1a3 3 0 0 1-4.2 0"/></svg>` : ""}</span>
           ${selected ? `<div class="layer-badges">
@@ -6130,6 +6160,7 @@ function renderLayers() {
   syncMaskBadge();
   syncCanvasCursor();
   drawManualEditingOverlay();
+  syncDuoLayerUi();
 }
 
 function syncAdjustmentTargetHighlight(adjustmentLayerId = null) {
@@ -6214,6 +6245,39 @@ function selectLayer(layerId, part = "content") {
   requestRender();
 }
 
+function closeDuoLayerSettings(restoreFocus = false) {
+  const settings = document.getElementById("duoLayerSettings");
+  settings.hidden = true;
+  delete settings.dataset.layerId;
+  document.getElementById("duoLayerActions").replaceChildren();
+  const trigger = document.querySelector('[data-phone-panel="layers"]');
+  if (dualScreenLayout) {
+    trigger.setAttribute("aria-expanded", "false");
+    trigger.classList.remove("active");
+  }
+  blendSelectMenu.hidden = true;
+  blendSelectTrigger.setAttribute("aria-expanded", "false");
+  clearBlendModePreview();
+  if (restoreFocus && dualScreenLayout) {
+    (layerList.querySelector(".selected .layer-action-button") || trigger).focus({ preventScroll: true });
+  }
+}
+
+function syncDuoLayerUi() {
+  if (!dualScreenLayout) return;
+  const layer = getSelectedLayer();
+  const settings = document.getElementById("duoLayerSettings");
+  if (!settings.hidden && settings.dataset.layerId !== layer?.id) closeDuoLayerSettings();
+  const name = document.getElementById("duoLayerName");
+  if (document.activeElement !== name) {
+    name.value = layer?.name || "";
+    name.setCustomValidity("");
+  }
+  const title = document.getElementById("phoneSheetTitle");
+  title.textContent = `${activePhonePanel === "brush" ? "Brush" : filterPanelTitle.textContent} · ${layer?.name || "No layer"}`;
+  title.title = title.textContent;
+}
+
 function showLayerMenu(row, layer) {
   document.querySelectorAll(".layer-actions-menu").forEach((menu) => menu.remove());
   const menu = document.createElement("div");
@@ -6238,12 +6302,30 @@ function showLayerMenu(row, layer) {
     ` : '<button data-menu-action="mask-add">Add mask</button>'}
     <div class="layer-actions-divider"></div>
     <button data-menu-action="delete" class="danger">Delete layer</button>`;
-  row.appendChild(menu);
+  if (dualScreenLayout) {
+    const settings = document.getElementById("duoLayerSettings");
+    settings.dataset.layerId = layer.id;
+    settings.hidden = false;
+    document.getElementById("duoLayerActions").append(menu);
+    const trigger = document.querySelector('[data-phone-panel="layers"]');
+    trigger.setAttribute("aria-expanded", "true");
+    trigger.classList.add("active");
+    syncDuoLayerUi();
+    document.getElementById("duoCloseLayerSettings").focus({ preventScroll: true });
+  } else row.appendChild(menu);
   menu.addEventListener("click", (event) => {
     const button = event.target.closest("[data-menu-action]");
     if (!button) return;
-    handleLayerMenuAction(layer, button.dataset.menuAction);
-    menu.remove();
+    const currentLayer = state.layers.find((item) => item.id === layer.id);
+    if (!currentLayer) {
+      showToast("This layer no longer exists.");
+      closeDuoLayerSettings();
+      menu.remove();
+      return;
+    }
+    handleLayerMenuAction(currentLayer, button.dataset.menuAction);
+    if (dualScreenLayout && button.dataset.menuAction !== "rename") closeDuoLayerSettings(true);
+    if (!dualScreenLayout) menu.remove();
   });
 }
 
@@ -6251,6 +6333,14 @@ function startLayerRename(layerId) {
   const layer = state.layers.find((item) => item.id === layerId);
   if (!layer) return;
   selectLayer(layer.id, layer.mask && state.selectionPart === "mask" ? "mask" : "content");
+  if (dualScreenLayout) {
+    const row = layerList.querySelector(`[data-layer-id="${layer.id}"]`);
+    showLayerMenu(row, layer);
+    const input = document.getElementById("duoLayerName");
+    input.focus({ preventScroll: true });
+    input.select();
+    return;
+  }
   const name = layerList.querySelector(`[data-layer-id="${layer.id}"] .layer-name`);
   if (!name) return;
 
@@ -7192,6 +7282,8 @@ function renderFilters() {
   const addFilterButton = document.getElementById("addFilterButton");
   const filterHint = document.querySelector(".filter-hint");
   if (!layer) {
+    filterPanelTitle.textContent = "Filters";
+    syncDuoLayerUi();
     filterList.innerHTML = "";
     filterRatioToggle.hidden = true;
     adjustmentRangeSettings.hidden = true;
@@ -7217,6 +7309,7 @@ function renderFilters() {
     button.tabIndex = active ? 0 : -1;
   });
   filterPanelTitle.textContent = showMaskSettings ? "Mask settings" : isHeight ? "Height Layer" : isMaterial ? "3D Material" : "Filters";
+  syncDuoLayerUi();
   filterAddWrap.hidden = Boolean(showMaskSettings) || (isSurfaceLayer && state.materialPanelTab !== "filters");
   addFilterButton.innerHTML = isSurfaceLayer ? "<span>+</span> Add post filter" : "<span>+</span> Add filter";
   filterPreview.hidden = Boolean(showMaskSettings) || (isSurfaceLayer && state.materialPanelTab !== "filters");
@@ -7922,6 +8015,9 @@ function loadProjectSettings() {
       && Number.isFinite(stored.ipad.brushPanelPosition.y)
       ? stored.ipad.brushPanelPosition
       : null;
+    state.workspace.dualScreenMode = ["auto", "manual", "single"].includes(stored.workspace?.dualScreenMode)
+      ? stored.workspace.dualScreenMode : "auto";
+    state.workspace.hingeWidth = clampPressureSetting(stored.workspace?.hingeWidth, 0, 200, 34);
     state.pressure.sizeMinimum = clampPressureSetting(stored.pressure?.sizeMinimum, 0, 1, 0.32);
     state.pressure.sizeResponse = clampPressureSetting(stored.pressure?.sizeResponse, 0.25, 3, 1);
     state.pressure.opacityMinimum = clampPressureSetting(stored.pressure?.opacityMinimum, 0, 1, 0.2);
@@ -7943,6 +8039,7 @@ function saveProjectSettings() {
     projectAutosave: state.projectAutosave,
     pressure: state.pressure,
     ipad: state.ipad,
+    workspace: state.workspace,
     filterMenuCategoryOrder: state.filterMenuCategoryOrder,
     filterMenuFilterOrders: state.filterMenuFilterOrders,
   }));
@@ -7986,6 +8083,9 @@ function syncSettingsPanel() {
   projectAutosaveEnabled.disabled = !window.shaderPaintDesktop?.isDesktop;
   projectAutosaveInterval.disabled = !window.shaderPaintDesktop?.isDesktop || !state.projectAutosave.enabled;
   ignoreTouchDraw.checked = state.ipad.ignoreTouchDraw;
+  dualScreenMode.value = state.workspace.dualScreenMode;
+  hingeWidth.value = String(state.workspace.hingeWidth);
+  hingeWidth.disabled = state.workspace.dualScreenMode !== "manual";
   syncPressureSettings();
 }
 
@@ -8008,10 +8108,311 @@ function setSettingsOpen(open) {
   if (open) syncSettingsPanel();
 }
 
+function dualScreenGeometry(segments, width, height) {
+  if (!Array.isArray(segments) || segments.length !== 2) return null;
+  const rects = segments.map((segment) => ({
+    x: segment.x ?? segment.left,
+    y: segment.y ?? segment.top,
+    width: segment.width,
+    height: segment.height,
+  }));
+  if (rects.some((rect) => !Object.values(rect).every(Number.isFinite)
+    || rect.x < 0 || rect.y < 0 || rect.width <= 0 || rect.height <= 0
+    || rect.x + rect.width > width + 1 || rect.y + rect.height > height + 1)) return null;
+  rects.sort((a, b) => Math.abs(a.x - b.x) < 1 ? a.y - b.y : a.x - b.x);
+  const [first, second] = rects;
+  const sideBySide = Math.abs(first.y - second.y) < 1 && Math.abs(first.height - second.height) < 1
+    && first.x + first.width <= second.x;
+  const stacked = Math.abs(first.x - second.x) < 1 && Math.abs(first.width - second.width) < 1
+    && first.y + first.height <= second.y;
+  if (!sideBySide && !stacked) return null;
+  return { axis: sideBySide ? "horizontal" : "vertical", canvas: first, controls: second };
+}
+
+function manualDualScreenSegments(width, height, gap) {
+  if (width >= height && width >= 900 && height >= 500) {
+    const segmentWidth = (width - gap) / 2;
+    return [
+      { x: 0, y: 0, width: segmentWidth, height },
+      { x: segmentWidth + gap, y: 0, width: segmentWidth, height },
+    ];
+  }
+  if (height > width && height >= 900 && width >= 500) {
+    const segmentHeight = (height - gap) / 2;
+    return [
+      { x: 0, y: 0, width, height: segmentHeight },
+      { x: 0, y: segmentHeight + gap, width, height: segmentHeight },
+    ];
+  }
+  return [];
+}
+
+function readViewportSegments() {
+  if (Array.isArray(window.viewport?.segments)) return window.viewport.segments;
+  if (Array.isArray(window.visualViewport?.segments)) return window.visualViewport.segments;
+  if (typeof window.getWindowSegments === "function") return window.getWindowSegments();
+  if (!horizontalSegments.matches && !verticalSegments.matches) return [];
+  return [[0, 0], horizontalSegments.matches ? [1, 0] : [0, 1]].map(([column, row]) => {
+    const probe = document.createElement("div");
+    probe.style.cssText = `position:fixed;visibility:hidden;pointer-events:none;
+      left:env(viewport-segment-left ${column} ${row}, -1px);
+      top:env(viewport-segment-top ${column} ${row}, -1px);
+      width:env(viewport-segment-width ${column} ${row}, 0px);
+      height:env(viewport-segment-height ${column} ${row}, 0px);`;
+    document.body.append(probe);
+    const rect = probe.getBoundingClientRect();
+    probe.remove();
+    return rect;
+  });
+}
+
+function initializePhoneLayout() {
+  const sheet = document.getElementById("phoneSheet");
+  const content = document.getElementById("phoneSheetContent");
+  const navigation = document.getElementById("phoneNavigation");
+  const workspace = document.querySelector(".workspace");
+  const panels = {
+    brush: document.getElementById("brushPanel"),
+    layers: document.getElementById("layersPanel"),
+    effects: document.getElementById("filtersPanel"),
+  };
+  const homes = new Map(Object.values(panels).map((panel) => {
+    const marker = document.createComment("Panel home");
+    panel.before(marker);
+    return [panel, marker];
+  }));
+  const motionHome = document.createComment("Motion control home");
+  motionButton.before(motionHome);
+  const layerSettingsControls = [panels.layers.querySelector(".layer-global-controls"), panels.layers.querySelector(".layer-toolbar")];
+  const controlHomes = new Map(layerSettingsControls.map((control) => {
+    const marker = document.createComment("Layer control home");
+    control.before(marker);
+    return [control, marker];
+  }));
+  let brushWasCollapsed = panels.brush.classList.contains("is-collapsed");
+  let appliedMode = null;
+  const menuClose = document.getElementById("phoneMenuClose");
+  const syncMenuClose = () => {
+    menuClose.hidden = !usesTouchWorkspace() || (filterMenu.hidden && newLayerMenu.hidden && blendSelectMenu.hidden);
+  };
+  const menuObserver = new MutationObserver(syncMenuClose);
+  [filterMenu, newLayerMenu, blendSelectMenu].forEach((menu) => menuObserver.observe(menu, { attributes: true, attributeFilter: ["hidden"] }));
+  const closeMenus = () => {
+    filterMenu.hidden = true;
+    newLayerMenu.hidden = true;
+    blendSelectMenu.hidden = true;
+    blendSelectTrigger.setAttribute("aria-expanded", "false");
+    clearBlendModePreview();
+    setBrushLibraryOpen(false);
+  };
+  const setPanel = (name, focus = false) => {
+    closeDuoLayerSettings();
+    if (dualScreenLayout) name = name === "brush" ? "brush" : "effects";
+    activePhonePanel = name;
+    sheet.hidden = !name;
+    workspace.classList.toggle("phone-panel-open", Boolean(name));
+    for (const [key, panel] of Object.entries(panels)) panel.hidden = dualScreenLayout ? key === "brush" && name !== "brush" : key !== name;
+    panels.effects.inert = Boolean(dualScreenLayout && name === "brush");
+    document.body.classList.toggle("duo-brush-open", Boolean(dualScreenLayout && name === "brush"));
+    document.getElementById("phoneCloseSheet").hidden = Boolean(dualScreenLayout && name !== "brush");
+    navigation.querySelectorAll("[data-phone-panel]").forEach((button) => {
+      const active = button.dataset.phonePanel === name;
+      button.setAttribute("aria-expanded", String(active));
+      button.classList.toggle("active", active);
+    });
+    document.getElementById("phoneSheetTitle").textContent = name
+      ? { brush: "Brush controls", layers: "Layers", effects: "Layer effects" }[name]
+      : "Editing controls";
+    syncDuoLayerUi();
+    closeMenus();
+    syncCanvasPresentation();
+    if (focus) {
+      const target = name ? (dualScreenLayout ? navigation.querySelector(`[data-phone-panel="${name}"]`) : document.getElementById("phoneCloseSheet"))
+        : navigation.querySelector(`[data-phone-panel="${setPanel.lastPanel || "brush"}"]`);
+      target.focus({ preventScroll: true });
+    }
+    if (name) setPanel.lastPanel = name;
+  };
+  const syncLayout = () => {
+    const segments = state.workspace.dualScreenMode === "manual"
+      ? manualDualScreenSegments(window.innerWidth, window.innerHeight, state.workspace.hingeWidth)
+      : state.workspace.dualScreenMode === "single" ? [] : readViewportSegments();
+    dualScreenLayout = dualScreenGeometry(segments, window.innerWidth, window.innerHeight);
+    const phone = usesTouchWorkspace();
+    const mode = dualScreenLayout ? "duo" : phone ? "phone" : "desktop";
+    document.body.classList.toggle("duo-layout", Boolean(dualScreenLayout));
+    if (dualScreenLayout) {
+      for (const [pane, rect] of Object.entries({ canvas: dualScreenLayout.canvas, controls: dualScreenLayout.controls })) {
+        for (const [key, value] of Object.entries(rect)) document.body.style.setProperty(`--duo-${pane}-${key}`, `${value}px`);
+      }
+      document.body.dataset.duoAxis = dualScreenLayout.axis;
+    } else {
+      delete document.body.dataset.duoAxis;
+      for (const pane of ["canvas", "controls"]) {
+        for (const key of ["x", "y", "width", "height"]) document.body.style.removeProperty(`--duo-${pane}-${key}`);
+      }
+    }
+    if (appliedMode === mode) {
+      syncCanvasPresentation();
+      return;
+    }
+    document.body.classList.toggle("phone-layout", phone);
+    panels.effects.inert = false;
+    closeDuoLayerSettings();
+    layerSettingsControls.forEach((control) => {
+      if (dualScreenLayout) document.getElementById("duoLayerControls").append(control);
+      else controlHomes.get(control).after(control);
+    });
+    const layerNavigation = navigation.querySelector('[data-phone-panel="layers"]');
+    layerNavigation.querySelector("span").textContent = dualScreenLayout ? "Layer settings" : "Layers";
+    layerNavigation.setAttribute("aria-controls", dualScreenLayout ? "duoLayerSettings" : "phoneSheet");
+    navigation.querySelector('[data-phone-panel="effects"] span').textContent = dualScreenLayout ? "Filters" : "Effects";
+    document.body.classList.remove("duo-brush-open");
+    document.getElementById("phoneSheetTitle").removeAttribute("title");
+    document.getElementById("phoneCloseSheet").hidden = false;
+    navigation.hidden = !phone;
+    if (phone && (appliedMode === null || appliedMode === "desktop")) {
+      brushWasCollapsed = panels.brush.classList.contains("is-collapsed");
+      panels.brush.classList.remove("is-collapsed");
+      Object.values(panels).forEach((panel) => content.append(panel));
+      document.getElementById("phoneCloseSheet").before(motionButton);
+    } else if (!phone) {
+      closeMenus();
+      activePhonePanel = null;
+      sheet.hidden = true;
+      workspace.classList.remove("phone-panel-open");
+      for (const panel of Object.values(panels)) {
+        panel.hidden = false;
+        homes.get(panel).after(panel);
+      }
+      panels.brush.classList.toggle("is-collapsed", brushWasCollapsed);
+      motionHome.after(motionButton);
+      syncBrushPanelPosition();
+    }
+    appliedMode = mode;
+    if (phone) setPanel(dualScreenLayout ? "effects" : null);
+    syncDockPanels();
+    syncManualToolUi();
+    syncCanvasPresentation();
+    syncMenuClose();
+  };
+  menuClose.addEventListener("click", closeMenus);
+  document.getElementById("duoCloseLayerSettings").addEventListener("click", () => closeDuoLayerSettings(true));
+  const layerName = document.getElementById("duoLayerName");
+  layerName.addEventListener("input", () => {
+    layerName.setCustomValidity(layerName.value.trim() ? "" : "Enter a layer name.");
+  });
+  layerName.addEventListener("change", () => {
+    if (!layerName.reportValidity()) {
+      showToast("Enter a layer name.");
+      return;
+    }
+    const layer = getSelectedLayer();
+    if (!layer || layer.id !== document.getElementById("duoLayerSettings").dataset.layerId) return;
+    const name = layerName.value.trim();
+    if (name === layer.name) return;
+    layer.name = name;
+    renderLayers();
+    renderFilters();
+    commitDocumentAction();
+  });
+  layerName.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    layerName.blur();
+  });
+  layerList.addEventListener("click", () => {
+    if (dualScreenLayout && performance.now() >= suppressLayerClickUntil) setPanel("effects");
+  }, true);
+  document.addEventListener("click", (event) => {
+    if (!dualScreenLayout || event.target.closest('#duoLayerSettings, #phoneMenuClose, [data-layer-action="menu"], [data-phone-panel="layers"]')) return;
+    closeDuoLayerSettings();
+  });
+  document.querySelector(".image-import-button").addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    imageInput.click();
+  });
+  document.addEventListener("click", (event) => {
+    if (!usesTouchWorkspace()) return;
+    if (event.target.closest('[data-menu-action="mask-settings"]')) setPanel("effects", true);
+  });
+  navigation.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-phone-panel]");
+    if (!button) return;
+    const name = button.dataset.phonePanel;
+    if (dualScreenLayout && name === "layers") {
+      const settings = document.getElementById("duoLayerSettings");
+      if (!settings.hidden) closeDuoLayerSettings(true);
+      else {
+        setPanel("effects");
+        const layer = getSelectedLayer();
+        if (layer) showLayerMenu(layerList.querySelector(`[data-layer-id="${layer.id}"]`), layer);
+        else showToast("Add or select a layer first.");
+      }
+      return;
+    }
+    setPanel(activePhonePanel === name ? null : name, true);
+  });
+  document.getElementById("phoneCloseSheet").addEventListener("click", () => setPanel(null, true));
+  document.getElementById("phoneApplyTransform").addEventListener("click", () => {
+    releaseManualPointerCapture();
+    state.manualInteraction = null;
+    setActiveManualTool("brush");
+  });
+  document.getElementById("phoneCancelTransform").addEventListener("click", () => {
+    cancelLayerTransform();
+    setActiveManualTool("brush");
+  });
+  window.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape" || !usesTouchWorkspace() || !activePhonePanel) return;
+    if (!document.getElementById("duoLayerSettings").hidden) {
+      if (!blendSelectMenu.hidden) closeMenus();
+      else {
+        layerName.value = getSelectedLayer()?.name || "";
+        layerName.setCustomValidity("");
+        closeDuoLayerSettings(true);
+      }
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      return;
+    }
+    if (isEditingTextField()) return;
+    if (!brushLibrary.hidden || !filterMenu.hidden || !newLayerMenu.hidden || !blendSelectMenu.hidden) {
+      closeMenus();
+    } else if (!dualScreenLayout || activePhonePanel === "brush") {
+      setPanel(null, true);
+    } else return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  });
+  phoneLayout.addEventListener("change", syncLayout);
+  horizontalSegments.addEventListener("change", syncLayout);
+  verticalSegments.addEventListener("change", syncLayout);
+  window.visualViewport?.addEventListener("resize", syncLayout);
+  window.screen.orientation?.addEventListener("change", syncLayout);
+  window.addEventListener("resize", syncLayout);
+  dualScreenMode.addEventListener("change", () => {
+    state.workspace.dualScreenMode = dualScreenMode.value;
+    saveProjectSettings();
+    syncSettingsPanel();
+    syncLayout();
+  });
+  hingeWidth.addEventListener("change", () => {
+    if (!hingeWidth.reportValidity()) return;
+    state.workspace.hingeWidth = Number(hingeWidth.value);
+    saveProjectSettings();
+    syncLayout();
+  });
+  const observer = new ResizeObserver(() => syncCanvasPresentation());
+  observer.observe(canvasStage);
+  syncLayout();
+}
+
 function syncDockPanels() {
   const rightDock = document.getElementById("rightDock");
-  const layersCollapsed = state.ipad.layersCollapsed;
-  const filtersCollapsed = state.ipad.filtersCollapsed;
+  const layersCollapsed = !usesTouchWorkspace() && state.ipad.layersCollapsed;
+  const filtersCollapsed = !usesTouchWorkspace() && state.ipad.filtersCollapsed;
   document.getElementById("layersPanel").classList.toggle("is-collapsed", layersCollapsed);
   document.getElementById("filtersPanel").classList.toggle("is-collapsed", filtersCollapsed);
   rightDock.classList.toggle("layers-collapsed", layersCollapsed);
@@ -8026,6 +8427,7 @@ function syncDockPanels() {
 }
 
 function syncBrushPanelPosition() {
+  if (usesTouchWorkspace()) return;
   const position = state.ipad.brushPanelPosition;
   if (!position) return;
   const brushPanel = document.getElementById("brushPanel");
@@ -9509,6 +9911,7 @@ function registerOfflineSupport() {
 }
 
 function wireEvents() {
+  initializePhoneLayout();
   enableRelativeRangeDragging();
   let pencilReadonlyInput = null;
   document.addEventListener("pointerdown", (event) => {
@@ -9693,6 +10096,7 @@ function wireEvents() {
   const brushPanelHandle = brushPanel.querySelector(".panel-heading");
   let brushPanelDrag = null;
   brushPanelHandle.addEventListener("pointerdown", (event) => {
+    if (usesTouchWorkspace()) return;
     if (event.target.closest("button")) return;
     const stageRect = canvasStage.getBoundingClientRect();
     const panelRect = brushPanel.getBoundingClientRect();
@@ -9742,7 +10146,9 @@ function wireEvents() {
   brushGrid.addEventListener("click", (event) => {
     const preset = event.target.closest("[data-brush-preset]")?.dataset.brushPreset;
     if (!preset) return;
-    void setBrushPreset(preset);
+    void setBrushPreset(preset).then(() => {
+      if (usesTouchWorkspace() && state.brush.presetId === preset) setBrushLibraryOpen(false);
+    });
   });
   document.getElementById("closeMaterialLibrary").addEventListener("click", () => setMaterialLibraryOpen(false));
   document.getElementById("closeProjectLibrary").addEventListener("click", () => setProjectLibraryOpen(false));
@@ -9991,7 +10397,6 @@ function wireEvents() {
     commitDocumentAction();
   });
 
-  let suppressLayerClickUntil = 0;
   layerList.addEventListener("click", (event) => {
     if (performance.now() < suppressLayerClickUntil) return;
     const row = event.target.closest(".layer-row");
@@ -10101,7 +10506,8 @@ function wireEvents() {
     layerPress = null;
   };
   layerList.addEventListener("pointerdown", (event) => {
-    if (event.pointerType === "mouse" || event.target.closest("button, input, .layer-name")) return;
+    const railHandle = dualScreenLayout && event.target.closest(".duo-layer-drag-handle");
+    if (event.pointerType === "mouse" || (!railHandle && event.target.closest("button, input, .layer-name"))) return;
     const row = event.target.closest(".layer-row");
     if (!row) return;
     layerPress = {
@@ -10209,6 +10615,7 @@ function wireEvents() {
       if (created) commitDocumentAction();
       else scheduleSave();
     }
+    if (dualScreenLayout && action !== "new") closeDuoLayerSettings(true);
   });
 
   document.getElementById("addLayerButton").addEventListener("click", (event) => openNewLayerMenu(event.currentTarget));
@@ -10379,7 +10786,9 @@ function wireEvents() {
     if (!event.target.closest("#newLayerMenu") && !event.target.closest('[data-layer-action="new"]') && event.target !== document.getElementById("addLayerButton")) {
       newLayerMenu.hidden = true;
     }
-    if (!event.target.closest(".layer-row")) document.querySelectorAll(".layer-actions-menu").forEach((menu) => menu.remove());
+    if (!event.target.closest(".layer-row, #duoLayerSettings") && document.getElementById("duoLayerSettings").hidden) {
+      document.querySelectorAll(".layer-actions-menu").forEach((menu) => menu.remove());
+    }
   });
 
   filterList.addEventListener("click", async (event) => {
@@ -10957,10 +11366,12 @@ function wireEvents() {
   document.getElementById("collapseBrush").addEventListener("click", () => {
     document.getElementById("brushPanel").classList.add("is-collapsed");
     document.getElementById("brushReopen").hidden = false;
+    syncCanvasPresentation();
   });
   document.getElementById("brushReopen").addEventListener("click", () => {
     document.getElementById("brushPanel").classList.remove("is-collapsed");
     document.getElementById("brushReopen").hidden = true;
+    syncCanvasPresentation();
   });
 
   const zoomRange = document.getElementById("zoomRange");
