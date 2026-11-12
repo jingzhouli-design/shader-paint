@@ -72,9 +72,13 @@ On screens up to 700 CSS pixels wide (or touch-device landscape screens up to
 980 pixels wide and 700 pixels high), the app uses a canvas-first phone layout.
 This includes iPhone portrait/landscape and folded Duo touch screens.
 
-- Brush, Layers and Effects in the bottom bar open one panel at a time. Tap
+- In portrait or Standard layout, Brush, Layers and Effects in the bottom bar open one panel at a time. Tap
   the active button or Done to return to the full canvas. Landscape places the
   panel beside the canvas. The same controls and document data are used on PC.
+- Auto also opens the filter-first workspace on touch landscape windows from
+  640 x 320 CSS pixels, without needing dual-screen APIs. The canvas stays on
+  the left; navigation, filters and the thumbnail layer rail stay on the right.
+  No hinge is assumed when the browser reports only one screen.
 - The image tool strip has visible labels. Apply and Cancel buttons let you
   finish transforms without a keyboard. Undo, redo, eraser, Fit and zoom stay
   reachable on the canvas. Transform handles have larger phone touch targets.
@@ -97,7 +101,21 @@ This includes iPhone portrait/landscape and folded Duo touch screens.
   The mask-painting target label lives in brush controls, outside the zoomed
   canvas, so it cannot cover the image or grow when zooming.
 
-## Duo dual-screen workspace
+## Filter-first and Duo workspace
+
+The filter-first layout is not limited to dual-screen hardware. In
+**Brush and input settings > Workspace layout**, choose **Auto (touch landscape /
+dual screen)** for wide mobile landscape, or **Filter-first (phone / preview)**
+to enable it explicitly in desktop preview. Ordinary mouse-driven desktop
+windows keep the desktop layout unless this explicit preview option is chosen.
+
+Phone View may only resize the browser; it does not necessarily emulate touch
+or expose two screens. For a reliable preview, choose **Filter-first (phone /
+preview)**. At 852 x 393 the areas sit side by side; at 393 x 852 they stack.
+Each area needs at least 320 CSS pixels in both dimensions. The explicit choice
+persists after reload; choose **Auto** or **Standard phone / desktop layout** to
+leave it. Standard disables both the filter-first fallback and spanning detection.
+Narrow portrait windows keep the normal bottom navigation in Auto.
 
 Span the browser across both screens. When the browser exposes two viewport
 segments, the app places the canvas and its toolbar entirely on the first
@@ -134,12 +152,12 @@ Automatic detection supports `window.viewport.segments`, the earlier
 media queries/environment variables. Support depends on the browser and OS.
 An empty or invalid newer API no longer prevents a valid older API or CSS
 viewport-segment detection from being used.
-If detection is unavailable, choose **Settings > Dual-screen workspace > Duo
+If detection is unavailable, choose **Settings > Workspace layout > Duo
 compatibility mode** and set **Hinge gap** in CSS pixels. This manual fallback
 assumes two equal screens, starts with a 34px gap, and follows window orientation.
 It activates at 900 x 500 or larger in landscape, or 500 x 900 in portrait;
-smaller folded windows return to single-screen layout. Choose **Single-screen
-layout** to disable spanning detection. These preferences are application
+smaller folded windows return to single-screen layout. Choose **Standard
+phone / desktop layout** to disable spanning detection and the fallback. These preferences are application
 settings, not part of project files. Physical Duo testing is still recommended.
 
 If browser bars, display scaling or a misleading viewport ratio prevent that
@@ -149,7 +167,7 @@ not infer orientation from viewport shape; they require at least 320 CSS pixels
 in both dimensions for each estimated screen. They still estimate equal areas
 around the configured hinge, so native detection is preferable for asymmetric
 browser/system bars. Fixed arrangements do not rotate or detect folding: switch
-back to Auto or Single-screen when no longer spanning both screens.
+back to Auto or Standard when no longer spanning both screens.
 
 Settings displays the current viewport size, active arrangement and actual
 detected (or estimated) screen areas. If dual-screen detection is unavailable

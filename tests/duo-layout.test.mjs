@@ -8,6 +8,7 @@ const source = readFileSync(new URL("../app.js", import.meta.url), "utf8");
 function helpers(extra = {}) {
   const context = vm.createContext({
     phoneLayout: { matches: false },
+    coarsePointer: { matches: false },
     dualScreenLayout: null,
     horizontalSegments: { matches: false },
     verticalSegments: { matches: false },
@@ -15,7 +16,7 @@ function helpers(extra = {}) {
     ...extra,
     window: { innerWidth: 1114, innerHeight: 720, ...extra.window },
   });
-  for (const name of ["dualScreenGeometry", "manualDualScreenSegments", "readViewportSegments", "usesTouchWorkspace", "syncDualScreenStatus"]) {
+  for (const name of ["dualScreenGeometry", "manualDualScreenSegments", "readViewportSegments", "readWorkspaceGeometry", "usesTouchWorkspace", "syncDualScreenStatus"]) {
     const match = source.match(new RegExp(`^function ${name}\\([^]*?^}`, "m"));
     assert.ok(match, `Missing application helper: ${name}`);
     vm.runInContext(match[0], context);
@@ -26,6 +27,93 @@ function helpers(extra = {}) {
 function plain(value) {
   return JSON.parse(JSON.stringify(value));
 }
+
+test("touch landscape opens the filter-first rail without any dual-screen API", () => {
+  for (const [width, height] of [[844, 390], [1114, 654], [640, 320]]) {
+    const h = helpers({ coarsePointer: { matches: true }, window: { innerWidth: width, innerHeight: height } });
+    const layout = h.readWorkspaceGeometry();
+    assert.equal(layout.axis, "horizontal");
+    assert.equal(layout.compact, true);
+    assert.equal(layout.canvas.width, width / 2);
+    assert.equal(layout.controls.x, layout.canvas.width);
+    assert.equal(layout.controls.height, height);
+    h.dualScreenLayout = layout;
+    assert.equal(h.usesTouchWorkspace(), true);
+  }
+});
+
+test("explicit filter-first preview works with a mouse and follows landscape or portrait", () => {
+  for (const [width, height, axis] of [[1024, 768, "horizontal"], [852, 393, "horizontal"], [393, 852, "vertical"]]) {
+    const h = helpers({
+      state: { workspace: { dualScreenMode: "compact" } },
+      window: { innerWidth: width, innerHeight: height },
+    });
+    const layout = h.readWorkspaceGeometry();
+    assert.equal(layout.compact, true);
+    assert.equal(layout.axis, axis);
+    assert.ok(layout.canvas.width >= 320 && layout.canvas.height >= 320);
+    assert.ok(layout.controls.width >= 320 && layout.controls.height >= 320);
+  }
+});
+
+test("automatic layout preserves ordinary desktop, narrow portrait and insufficient landscape space", () => {
+  for (const [width, height, touch] of [[1440, 900, false], [844, 390, false], [393, 852, true], [639, 360, true], [844, 319, true]]) {
+    const h = helpers({
+      coarsePointer: { matches: touch },
+      window: { innerWidth: width, innerHeight: height },
+    });
+    assert.equal(h.readWorkspaceGeometry(), null);
+  }
+  const phone = helpers({ phoneLayout: { matches: true }, window: { innerWidth: 700, innerHeight: 390 } });
+  assert.equal(phone.readWorkspaceGeometry().compact, true);
+});
+
+test("native boundaries take priority over single-screen filter-first estimates", () => {
+  const segments = [{ x: 0, y: 56, width: 540, height: 664 }, { x: 574, y: 0, width: 504, height: 688 }];
+  for (const mode of ["auto", "compact"]) {
+    const h = helpers({
+      state: { workspace: { dualScreenMode: mode } },
+      coarsePointer: { matches: true },
+      window: { innerWidth: 1078, innerHeight: 720, viewport: { segments } },
+    });
+    assert.deepEqual(plain(h.readWorkspaceGeometry()), { axis: "horizontal", canvas: segments[0], controls: segments[1] });
+  }
+});
+
+test("standard and manual Duo modes respect explicit choices", () => {
+  for (const mode of ["single", "manual", "manual-vertical"]) {
+    const h = helpers({
+      state: { workspace: { dualScreenMode: mode, hingeWidth: 34 } },
+      coarsePointer: { matches: true },
+      window: { innerWidth: 844, innerHeight: 390 },
+    });
+    assert.equal(h.readWorkspaceGeometry(), null);
+  }
+  const small = helpers({
+    state: { workspace: { dualScreenMode: "compact" } },
+    window: { innerWidth: 393, innerHeight: 600 },
+  });
+  assert.equal(small.readWorkspaceGeometry(), null);
+});
+
+test("workspace status distinguishes responsive panes from detected hardware and explains Phone View", () => {
+  const status = { textContent: "" };
+  const h = helpers({
+    coarsePointer: { matches: true },
+    window: { innerWidth: 844, innerHeight: 390 },
+    document: { getElementById: () => status },
+  });
+  h.dualScreenLayout = h.readWorkspaceGeometry();
+  h.syncDualScreenStatus();
+  assert.match(status.textContent, /Filter-first workspace.*single screen; no detected hinge/);
+  assert.doesNotMatch(status.textContent, /screens \(detected\)/);
+  h.dualScreenLayout = null;
+  h.syncDualScreenStatus();
+  assert.match(status.textContent, /Phone View/);
+  h.state.workspace.dualScreenMode = "compact";
+  h.syncDualScreenStatus();
+  assert.match(status.textContent, /640 x 320.*320 x 640/);
+});
 
 function layerGestures(duo = true) {
   const listeners = {};

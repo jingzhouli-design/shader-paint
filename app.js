@@ -4,6 +4,7 @@ import { FILTER_DEFS, defaultParamsFor, evalGradientAt, fragmentShaderForPass, n
 let DOC_WIDTH = 1200;
 let DOC_HEIGHT = 900;
 const phoneLayout = window.matchMedia("(max-width: 700px), (max-width: 980px) and (max-height: 700px) and (pointer: coarse)");
+const coarsePointer = window.matchMedia("(pointer: coarse)");
 const horizontalSegments = window.matchMedia("(horizontal-viewport-segments: 2)");
 const verticalSegments = window.matchMedia("(vertical-viewport-segments: 2)");
 let dualScreenLayout = null;
@@ -8028,7 +8029,7 @@ function loadProjectSettings() {
       && Number.isFinite(stored.ipad.brushPanelPosition.y)
       ? stored.ipad.brushPanelPosition
       : null;
-    state.workspace.dualScreenMode = ["auto", "manual", "manual-horizontal", "manual-vertical", "single"].includes(stored.workspace?.dualScreenMode)
+    state.workspace.dualScreenMode = ["auto", "compact", "manual", "manual-horizontal", "manual-vertical", "single"].includes(stored.workspace?.dualScreenMode)
       ? stored.workspace.dualScreenMode : "auto";
     state.workspace.hingeWidth = clampPressureSetting(stored.workspace?.hingeWidth, 0, 200, 34);
     state.pressure.sizeMinimum = clampPressureSetting(stored.pressure?.sizeMinimum, 0, 1, 0.32);
@@ -8192,17 +8193,37 @@ function readViewportSegments() {
   });
 }
 
+function readWorkspaceGeometry() {
+  const { innerWidth: width, innerHeight: height } = window;
+  const mode = state.workspace.dualScreenMode;
+  const segments = mode.startsWith("manual")
+    ? manualDualScreenSegments(width, height, state.workspace.hingeWidth, mode === "manual" ? "auto" : mode.slice(7))
+    : mode === "single" ? [] : readViewportSegments();
+  const screens = dualScreenGeometry(segments, width, height);
+  if (screens) return screens;
+  const responsive = mode === "auto"
+    && (phoneLayout.matches || coarsePointer.matches) && width > height;
+  if (mode !== "compact" && !responsive) return null;
+  const workspace = dualScreenGeometry(manualDualScreenSegments(width, height, 0, width >= height ? "horizontal" : "vertical"), width, height);
+  return workspace ? { ...workspace, compact: true } : null;
+}
+
 function syncDualScreenStatus() {
   const mode = state.workspace.dualScreenMode;
   const viewport = `Viewport: ${window.innerWidth} x ${window.innerHeight} CSS px.`;
   if (dualScreenLayout) {
-    const { axis, canvas, controls } = dualScreenLayout;
+    const { axis, canvas, controls, compact } = dualScreenLayout;
     const size = (rect) => `${Number(rect.width.toFixed(1))} x ${Number(rect.height.toFixed(1))}`;
-    document.getElementById("dualScreenStatus").textContent = `${viewport} ${axis === "horizontal" ? "Side-by-side" : "Stacked"} screens (${mode === "auto" ? "detected" : "manual estimate"}). Canvas: ${size(canvas)}; controls: ${size(controls)}.`;
+    const arrangement = axis === "horizontal" ? "Side-by-side" : "Stacked";
+    const description = compact
+      ? `Filter-first workspace (${arrangement.toLowerCase()}, single screen; no detected hinge).`
+      : `${arrangement} screens (${mode === "auto" || mode === "compact" ? "detected" : "manual estimate"}).`;
+    document.getElementById("dualScreenStatus").textContent = `${viewport} ${description} Canvas: ${size(canvas)}; controls: ${size(controls)}.`;
   } else {
     const reason = mode === "auto"
-      ? "No usable dual-screen boundaries reported. Span the browser across both screens, or choose a manual arrangement."
-      : mode === "single" ? "Dual-screen detection is disabled."
+      ? "No usable dual-screen boundaries reported. Touch landscape uses the filter-first layout from 640 x 320 CSS px. For desktop Phone View, choose Filter-first (phone / preview); resizing alone does not emulate touch or two screens."
+      : mode === "single" ? "Filter-first layout and dual-screen detection are disabled."
+        : mode === "compact" ? "Filter-first needs at least 640 x 320 CSS px side-by-side, or 320 x 640 stacked. Rotate or enlarge the preview."
         : mode === "manual" ? "Automatic compatibility needs a 900 x 500 or 500 x 900 CSS px window. For a smaller spanned window, choose a fixed arrangement."
         : "Window is too small for this arrangement. Each manual screen needs at least 320 CSS px in both dimensions.";
     document.getElementById("dualScreenStatus").textContent = `${viewport} Single-screen workspace. ${reason}`;
@@ -8277,11 +8298,7 @@ function initializePhoneLayout() {
     if (name) setPanel.lastPanel = name;
   };
   const syncLayout = () => {
-    const layoutMode = state.workspace.dualScreenMode;
-    const segments = layoutMode.startsWith("manual")
-      ? manualDualScreenSegments(window.innerWidth, window.innerHeight, state.workspace.hingeWidth, layoutMode === "manual" ? "auto" : layoutMode.slice(7))
-      : state.workspace.dualScreenMode === "single" ? [] : readViewportSegments();
-    dualScreenLayout = dualScreenGeometry(segments, window.innerWidth, window.innerHeight);
+    dualScreenLayout = readWorkspaceGeometry();
     syncDualScreenStatus();
     const phone = usesTouchWorkspace();
     const mode = dualScreenLayout ? "duo" : phone ? "phone" : "desktop";
@@ -8432,6 +8449,7 @@ function initializePhoneLayout() {
     event.stopImmediatePropagation();
   });
   phoneLayout.addEventListener("change", syncLayout);
+  coarsePointer.addEventListener("change", syncLayout);
   horizontalSegments.addEventListener("change", syncLayout);
   verticalSegments.addEventListener("change", syncLayout);
   window.visualViewport?.addEventListener("resize", syncLayout);

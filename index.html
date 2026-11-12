@@ -476,13 +476,14 @@
         <p class="settings-note">When enabled, only a pen or mouse can draw on the canvas. Touch still works for controls and canvas gestures.</p>
       </section>
       <section class="settings-section">
-        <label class="settings-section-label" for="dualScreenMode">Dual-screen workspace</label>
+        <label class="settings-section-label" for="dualScreenMode">Workspace layout</label>
         <select id="dualScreenMode">
-          <option value="auto">Auto-detect screens</option>
+          <option value="auto">Auto (touch landscape / dual screen)</option>
+          <option value="compact">Filter-first (phone / preview)</option>
           <option value="manual">Duo compatibility mode</option>
           <option value="manual-horizontal">Duo: side-by-side screens (manual)</option>
           <option value="manual-vertical">Duo: stacked screens (manual)</option>
-          <option value="single">Single-screen layout</option>
+          <option value="single">Standard phone / desktop layout</option>
         </select>
         <p id="dualScreenStatus" class="settings-note" role="status" aria-live="polite"></p>
         <label class="settings-number-row" for="hingeWidth">
@@ -490,7 +491,7 @@
           <input id="hingeWidth" type="number" min="0" max="200" step="1" value="34" required />
           <small>CSS px</small>
         </label>
-        <p class="settings-note">Span the browser across both screens first. Auto uses actual screen boundaries, including unequal areas beside system or browser bars. Duo compatibility follows window rotation and returns to one screen when folded. If bars or scaling confuse detection, choose the actual side-by-side or stacked arrangement manually and adjust the gap. Fixed arrangements estimate equal areas and do not follow rotation; switch back to Auto when folded.</p>
+        <p class="settings-note">Auto opens the filter-first workspace on a wide touch landscape screen, even without dual-screen APIs. Phone View alone may only resize the window: choose Filter-first (phone / preview) to enable the layer rail explicitly. It uses side-by-side areas in landscape or stacked areas in portrait, with no assumed hinge. Detected dual-screen boundaries take priority. For a real hinge that cannot be detected, choose a manual Duo arrangement and adjust the gap; fixed arrangements do not follow rotation.</p>
       </section>
       <section class="settings-section">
         <span class="settings-section-label">Shortcuts</span>
