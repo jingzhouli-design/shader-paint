@@ -47,7 +47,7 @@
             <svg viewBox="0 0 20 20" id="motionButtonIcon"><path d="M6.5 4.5v11M13.5 4.5v11"/></svg>
             <span id="motionButtonLabel">Pause FX</span>
           </button>
-          <label class="button secondary" for="imageInput">
+          <label class="button secondary image-import-button" for="imageInput" aria-label="Import image" role="button" tabindex="0">
             <svg viewBox="0 0 20 20"><path d="M10 13V3m0 0L6.7 6.3M10 3l3.3 3.3M4 11v5h12v-5"/></svg>
             Import image
           </label>
@@ -96,6 +96,11 @@
               <svg viewBox="0 0 20 20"><path d="m3.2 13.8 2.2-9.4 8.8-1.1 2.6 8.1-6.4 5.3z"/><circle cx="5.4" cy="4.4" r="1"/><circle cx="16.8" cy="11.4" r="1"/></svg>
             </button>
           </div>
+          <div class="phone-transform-actions" id="phoneTransformActions" hidden aria-label="Transform actions">
+            <button type="button" id="phoneCancelTransform">Cancel</button>
+            <button type="button" id="phoneApplyTransform">Apply</button>
+          </div>
+          <p class="phone-gesture-hint">Two fingers to zoom &amp; pan</p>
           <aside class="brush-panel glass-panel" id="brushPanel">
             <div class="panel-heading">
               <div>
@@ -108,6 +113,10 @@
               <span class="brush-swatch" id="brushPreviewDot"></span>
               <span class="brush-preview-change">Change</span>
             </button>
+            <div class="mask-mode-badge" id="maskModeBadge">
+              <span></span>
+              Painting <b>Botanical texture mask</b>
+            </div>
             <div class="control-row">
               <label for="brushSize">Size</label>
               <input id="brushSize" type="range" min="2" max="300" step="1" value="96" />
@@ -194,10 +203,6 @@
             <div class="canvas-empty" id="canvasEmpty">
               <strong>Preparing canvas</strong>
               <span>Loading the local starter image...</span>
-            </div>
-            <div class="mask-mode-badge" id="maskModeBadge">
-              <span></span>
-              Painting <b>Botanical texture mask</b>
             </div>
             <div class="brush-cursor" id="brushCursor"></div>
             <div class="eyedropper-indicator" id="eyedropperIndicator" hidden><i></i><span></span></div>
@@ -295,8 +300,39 @@
             </label>
           </section>
         </aside>
+        <section class="phone-sheet" id="phoneSheet" aria-label="Editing controls" hidden>
+          <header class="phone-sheet-header">
+            <strong id="phoneSheetTitle">Brush</strong>
+            <button type="button" id="phoneCloseSheet" aria-label="Close editing controls">Done</button>
+          </header>
+          <div class="phone-sheet-content" id="phoneSheetContent">
+            <section id="duoLayerSettings" class="duo-layer-settings" role="dialog" aria-labelledby="duoLayerSettingsTitle" hidden>
+              <header class="phone-sheet-header">
+                <strong id="duoLayerSettingsTitle">Layer settings</strong>
+                <button type="button" id="duoCloseLayerSettings" aria-label="Close layer settings">Done</button>
+              </header>
+              <label class="duo-layer-name">Layer name
+                <input id="duoLayerName" type="text" required aria-label="Layer name" />
+              </label>
+              <div id="duoLayerControls"></div>
+              <div id="duoLayerActions"></div>
+            </section>
+          </div>
+        </section>
       </section>
+      <nav class="phone-navigation" id="phoneNavigation" aria-label="Editing panels" hidden>
+        <button type="button" data-phone-panel="brush" aria-controls="phoneSheet" aria-expanded="false">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 14 8.8-8.8 1.9 1.9L7 15.8 4 17z"/></svg><span>Brush</span>
+        </button>
+        <button type="button" data-phone-panel="layers" aria-controls="phoneSheet" aria-expanded="false">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m10 3 7 4-7 4-7-4zM3 11l7 4 7-4M3 15l7 4 7-4"/></svg><span>Layers</span>
+        </button>
+        <button type="button" data-phone-panel="effects" aria-controls="phoneSheet" aria-expanded="false">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 5h14M3 10h14M3 15h14"/><circle cx="7" cy="5" r="2"/><circle cx="13" cy="10" r="2"/><circle cx="8" cy="15" r="2"/></svg><span>Effects</span>
+        </button>
+      </nav>
     </main>
+    <button class="phone-menu-close" id="phoneMenuClose" type="button" hidden>Close menu</button>
 
     <div class="layer-create-menu glass-panel" id="newLayerMenu" hidden>
       <button data-new-layer="base-copy">
@@ -431,13 +467,27 @@
         </div>
       </section>
       <section class="settings-section">
-        <span class="settings-section-label">iPad input</span>
+        <span class="settings-section-label">Touch input</span>
         <label class="settings-toggle-row">
           <span>Ignore touch drawing</span>
           <input id="ignoreTouchDraw" type="checkbox" />
           <i></i>
         </label>
-        <p class="settings-note">When enabled, only Apple Pencil or a mouse can draw on the canvas. Touch still works for controls and canvas gestures.</p>
+        <p class="settings-note">When enabled, only a pen or mouse can draw on the canvas. Touch still works for controls and canvas gestures.</p>
+      </section>
+      <section class="settings-section">
+        <label class="settings-section-label" for="dualScreenMode">Dual-screen workspace</label>
+        <select id="dualScreenMode">
+          <option value="auto">Auto-detect screens</option>
+          <option value="manual">Duo compatibility mode</option>
+          <option value="single">Single-screen layout</option>
+        </select>
+        <label class="settings-number-row" for="hingeWidth">
+          <span>Hinge gap</span>
+          <input id="hingeWidth" type="number" min="0" max="200" step="1" value="34" required />
+          <small>CSS px</small>
+        </label>
+        <p class="settings-note">Span the browser across both screens first. Auto uses the actual screen boundaries. If your browser cannot detect them, choose Duo compatibility mode and adjust the gap. It follows rotation and returns to a single-screen layout when folded to a smaller window.</p>
       </section>
       <section class="settings-section">
         <span class="settings-section-label">Shortcuts</span>
